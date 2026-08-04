@@ -16,6 +16,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from repo_agent import __version__
+from repo_agent.planning import run_planning
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -44,6 +45,8 @@ def _agent_definitions() -> list[dict[str, str]]:
                 "id": metadata.get("id", definition_path.stem),
                 "status": metadata.get("status", "unknown"),
                 "execution": metadata.get("execution", "unknown"),
+                "provider": metadata.get("provider", "none"),
+                "model": metadata.get("model", "none"),
                 "definition": str(definition_path),
             }
         )
@@ -393,7 +396,9 @@ def daemon() -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="repo-agent")
-    parser.add_argument("command", choices=("agents", "daemon", "health", "run-once", "version"))
+    parser.add_argument(
+        "command", choices=("agents", "daemon", "health", "plan-once", "run-once", "version")
+    )
     args = parser.parse_args()
 
     if args.command == "version":
@@ -404,6 +409,8 @@ def main() -> None:
         return
     if args.command == "run-once":
         sys.exit(run_inventory())
+    if args.command == "plan-once":
+        sys.exit(run_planning())
     if args.command == "daemon":
         sys.exit(daemon())
     sys.exit(health())

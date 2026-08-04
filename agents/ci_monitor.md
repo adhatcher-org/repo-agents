@@ -2,6 +2,8 @@
 id: ci_monitor
 status: planned
 execution: deterministic
+provider: none
+model: none
 ---
 
 # CI Monitor
