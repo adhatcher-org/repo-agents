@@ -1,0 +1,65 @@
+name: Publish container image
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ghcr-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve immutable release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          date_tag="$(date -u +%Y.%m.%d)"
+          max=0
+          while IFS= read -r tag; do
+            suffix="${tag#"${date_tag}-"}"
+            if [[ "$suffix" =~ ^[0-9]+$ ]] && (( suffix > max )); then
+              max="$suffix"
+            fi
+          done < <(git tag -l "${date_tag}-*")
+          echo "tag=${date_tag}-$((max + 1))" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/adhatcher-org/repo-agent:${{ steps.release.outputs.tag }}
+            ghcr.io/adhatcher-org/repo-agent:latest
+            ghcr.io/adhatcher-org/repo-agent:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+
+      - name: Create matching Git tag
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
