@@ -6,10 +6,11 @@ from pathlib import Path
 from subprocess import CalledProcessError
 from types import SimpleNamespace
 from urllib.error import URLError
+from urllib.request import Request
 
 import pytest
 
-from repo_agent import cli
+from repo_agent import cli, planning
 
 
 class _Response:
@@ -116,6 +117,273 @@ def test_agent_definitions_skip_unreadable_and_default_missing_metadata(
     monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
 
     assert cli._agent_definitions()[0]["status"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 120), ("15", 15)],
+)
+def test_planning_request_timeout_defaults_and_accepts_positive_integers(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
+) -> None:
+    if value is None:
+        monkeypatch.delenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", value)
+
+    assert planning._request_timeout() == expected
+
+
+@pytest.mark.parametrize("value", ["invalid", "0"])
+def test_planning_request_timeout_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(RuntimeError, match="OLLAMA_REQUEST_TIMEOUT_SECONDS"):
+        planning._request_timeout()
+
+
+def test_ollama_json_posts_structured_request_and_decodes_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request: object, timeout: int) -> _Response:
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return _Response({"message": {"content": '{"summary":"ok"}'}})
+
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434/")
+    monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(planning, "urlopen", fake_urlopen)
+
+    assert planning._ollama_json("architect", "instructions", {"work_items": []}) == {
+        "summary": "ok"
+    }
+    request = captured["request"]
+    assert isinstance(request, type(Request("http://example.test")))
+    assert request.full_url == "http://ollama:11434/api/chat"
+    assert captured["timeout"] == 5
+
+
+def test_agent_instructions_reads_markdown_body_from_mounted_definition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "architect.md").write_text(
+        "---\nid: senior_architect\nstatus: active\n---\n# Editable prompt\n\nReturn JSON.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
+
+    assert planning._agent_instructions("senior_architect") == "# Editable prompt\n\nReturn JSON."
+
+
+def test_agent_instructions_rejects_missing_definition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        planning._agent_instructions("senior_architect")
+
+
+def test_agent_instructions_rejects_empty_definition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "architect.md").write_text("---\nid: senior_architect\n---\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match="empty"):
+        planning._agent_instructions("senior_architect")
+
+
+@pytest.mark.parametrize(
+    "payload, message",
+    [
+        ({"message": {"content": "not-json"}}, "not valid JSON"),
+        ({"message": {"content": "[]"}}, "must be a JSON object"),
+        ({}, "message content string"),
+    ],
+)
+def test_ollama_json_rejects_invalid_model_responses(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, object], message: str
+) -> None:
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    monkeypatch.setattr(planning, "urlopen", lambda *_args, **_kwargs: _Response(payload))
+
+    with pytest.raises(RuntimeError, match=message):
+        planning._ollama_json("architect", "instructions", {})
+
+
+def test_ollama_json_wraps_transport_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434")
+    monkeypatch.setattr(
+        planning,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("unreachable")),
+    )
+
+    with pytest.raises(RuntimeError, match="Ollama request failed"):
+        planning._ollama_json("architect", "instructions", {})
+
+
+@pytest.mark.parametrize(
+    ("alert", "title", "severity"),
+    [
+        (
+            {"security_advisory": {"summary": "Dependency issue", "severity": "HIGH"}},
+            "Dependency issue",
+            "high",
+        ),
+        ({}, "Security alert", "unclassified"),
+    ],
+)
+def test_planning_alert_helpers(alert: dict[str, object], title: str, severity: str) -> None:
+    assert planning._alert_title(alert) == title
+    assert planning._alert_severity(alert) == severity
+
+
+def test_work_items_cover_pr_alerts_and_unavailable_security_sources() -> None:
+    items = planning.work_items(
+        {
+            "repositories": [
+                {
+                    "repository": "owner/repo",
+                    "open_pull_requests": {
+                        "items": [{"number": 7, "title": "Bump", "url": "https://example.test/pr"}]
+                    },
+                    "dependabot": {"status": "available", "alerts": []},
+                    "code_scanning": {
+                        "status": "available",
+                        "alerts": [
+                            {
+                                "number": 8,
+                                "html_url": "https://example.test/alert",
+                                "rule": {"name": "Stack trace exposure"},
+                                "security_severity_level": "medium",
+                            }
+                        ],
+                    },
+                    "secret_scanning": {"status": "unavailable"},
+                }
+            ]
+        }
+    )
+
+    assert [item["id"] for item in items] == [
+        "owner/repo:pr:7",
+        "owner/repo:code_scanning:8",
+        "owner/repo:unavailable:secret_scanning",
+    ]
+    assert items[1]["severity"] == "medium"
+
+
+def test_validate_architect_plan_requires_exact_coverage() -> None:
+    plan = {
+        "items": [{"id": "owner/repo:pr:7", "disposition": "review", "acceptance_criteria": []}]
+    }
+
+    assert planning._validate_architect_plan(plan, {"owner/repo:pr:7"}) == plan
+    with pytest.raises(RuntimeError, match="missing"):
+        planning._validate_architect_plan(plan, {"owner/repo:pr:7", "owner/repo:pr:8"})
+
+
+def test_run_planning_persists_blocked_report_when_models_are_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    inventory = {
+        "status": "passed",
+        "repositories": [
+            {
+                "repository": "owner/repo",
+                "open_pull_requests": {"items": [{"number": 7, "title": "Bump"}]},
+                "dependabot": {"status": "available", "alerts": []},
+                "code_scanning": {"status": "available", "alerts": []},
+                "secret_scanning": {"status": "available", "alerts": []},
+            }
+        ],
+    }
+    (tmp_path / "latest-inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("OLLAMA_ARCHITECT_MODEL", raising=False)
+
+    assert planning.run_planning() == 1
+
+    report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "OLLAMA_ARCHITECT_MODEL" in report["error"]
+    assert json.loads(capsys.readouterr().out)["event"] == "planning_completed"
+
+
+def test_run_planning_requires_independent_approved_critic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inventory = {
+        "status": "passed",
+        "repositories": [
+            {
+                "repository": "owner/repo",
+                "open_pull_requests": {"items": [{"number": 7, "title": "Bump"}]},
+                "dependabot": {"status": "available", "alerts": []},
+                "code_scanning": {"status": "available", "alerts": []},
+                "secret_scanning": {"status": "available", "alerts": []},
+            }
+        ],
+    }
+    (tmp_path / "latest-inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("OLLAMA_ARCHITECT_MODEL", "architect")
+    monkeypatch.setenv("OLLAMA_CRITIC_MODEL", "critic")
+    monkeypatch.setattr(planning, "_agent_instructions", lambda _agent_id: "prompt")
+    responses = iter(
+        [
+            {
+                "summary": "Review the update",
+                "architecture_document_updates": [],
+                "items": [
+                    {
+                        "id": "owner/repo:pr:7",
+                        "disposition": "review_and_test",
+                        "rationale": "Dependency update",
+                        "acceptance_criteria": ["Tests pass"],
+                        "architecture_impact": "none",
+                    }
+                ],
+            },
+            {
+                "verdict": "approved",
+                "covered_item_ids": ["owner/repo:pr:7"],
+                "findings": [],
+            },
+        ]
+    )
+    monkeypatch.setattr(planning, "_ollama_json", lambda *_args: next(responses))
+
+    assert planning.run_planning() == 0
+
+    report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
+    assert report["status"] == "approved"
+    assert report["architect_model"] == "architect"
+    assert report["critic"]["verdict"] == "approved"
+
+
+def test_run_planning_records_no_work_without_calling_ollama(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inventory = {"status": "passed", "repositories": []}
+    (tmp_path / "latest-inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        planning,
+        "_ollama_json",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("Ollama should not be called")),
+    )
+
+    assert planning.run_planning() == 0
+
+    report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
+    assert report["status"] == "no_work"
 
 
 def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -14,7 +14,41 @@ Each role has an individual Markdown definition in `agents/`. The front matter d
 docker exec repo-agent repo-agent agents
 ```
 
-Only `team_lead` is active in this milestone. Every other agent is deliberately marked `planned` until its approval and isolation boundaries are implemented.
+`team_lead`, `senior_architect`, and `senior_architect_critic` are active in the read-only
+inventory/planning milestone. The software-engineer, test, PR-review, and CI-monitor roles remain
+deliberately planned until their isolated write and verification boundaries are implemented.
+
+## Architect and critic planning stage
+
+The active planning stage is read-only and deliberately separate from the daily inventory daemon.
+It reads the latest successful inventory, creates a structured plan with the architect model, and
+requires the critic model to validate coverage of every open PR, security alert, and unavailable
+security source. It writes both JSON and Markdown reports under `data/runs/` and updates
+`latest-architect-plan.json` and `latest-architect-plan.md`.
+
+Configure two installed local models in the Unraid Compose stack or `.env` file:
+
+```dotenv
+OLLAMA_ARCHITECT_MODEL=YOUR_PLANNING_MODEL
+OLLAMA_CRITIC_MODEL=YOUR_CRITIC_MODEL
+OLLAMA_REQUEST_TIMEOUT_SECONDS=120
+```
+
+The mounted `agents/senior_architect.md` and `agents/senior_architect_critic.md` files are the
+live prompts. You can tune their role instructions and output guidance without rebuilding the
+image; rerun the command below to use the edited definitions. The application still rejects an
+incomplete architect response or critic coverage, regardless of prompt content.
+
+Run the stage manually after reviewing the inventory:
+
+```bash
+docker exec repo-agent repo-agent plan-once
+```
+
+`approved`, `changes_requested`, and `no_work` are completed planning outcomes. `blocked` means
+the inventory was not successful, a model was not configured, Ollama failed, or either model did
+not return the required complete JSON contract. This stage never changes repositories, documents,
+branches, pull requests, or alerts.
 
 ## Run through Unraid Compose
 

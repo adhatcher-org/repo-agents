@@ -3,12 +3,18 @@ services:
     image: ghcr.io/adhatcher-org/repo-agent:latest
     container_name: repo-agent
     restart: unless-stopped
+    pull_policy: always
+    user: "99:100"
     environment:
       TZ: America/New_York
       OLLAMA_BASE_URL: http://ollama:11434
       AGENT_CONFIG: /config/repos.yml
       AGENT_STATE_DIR: /data
+      AGENT_DEFINITIONS_DIR: /agents
       AGENT_RUN_INTERVAL_SECONDS: "86400"
+      OLLAMA_ARCHITECT_MODEL: ${OLLAMA_ARCHITECT_MODEL:-}
+      OLLAMA_CRITIC_MODEL: ${OLLAMA_CRITIC_MODEL:-}
+      OLLAMA_REQUEST_TIMEOUT_SECONDS: ${OLLAMA_REQUEST_TIMEOUT_SECONDS:-120}
       GITHUB_TOKEN_FILE: /run/secrets/github-token
       HOME: /tmp
       XDG_CACHE_HOME: /tmp/.cache
