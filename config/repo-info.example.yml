@@ -1,0 +1,19 @@
+repositories:
+  - slug: OWNER/REPOSITORY
+    path: /work/REPOSITORY
+    default_branch: main
+    architecture_docs:
+      - docs/architecture.md
+    quality_gates:
+      bootstrap: uv sync --all-groups
+      test: make test
+      coverage: make coverage
+      lint: make lint
+      format: make format-check
+      security: make security
+      minimum_coverage: 90
+    policy:
+      create_draft_prs: true
+      never_merge: true
+      require_architect_critic: true
+      address_severities: [critical, high, medium]
