@@ -2,6 +2,10 @@
 id: pr_reviewer
 status: planned
 execution: llm
+provider: ollama
+model: qwen3-coder:30b
+temperature: "0"
+timeout_seconds: "180"
 ---
 
 # PR Reviewer

@@ -15,26 +15,25 @@ def _ollama_chat_url(base_url: str) -> str:
     return f"{base_url.rstrip('/')}/api/chat"
 
 
-def _request_timeout() -> int:
-    value = os.environ.get("OLLAMA_REQUEST_TIMEOUT_SECONDS", "120")
+def _positive_integer(value: str, setting: str) -> int:
     try:
         timeout = int(value)
     except ValueError as exc:
-        raise RuntimeError("OLLAMA_REQUEST_TIMEOUT_SECONDS must be an integer") from exc
+        raise RuntimeError(f"{setting} must be an integer") from exc
     if timeout < 1:
-        raise RuntimeError("OLLAMA_REQUEST_TIMEOUT_SECONDS must be at least 1")
+        raise RuntimeError(f"{setting} must be at least 1")
     return timeout
 
 
-def _model(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} must name an installed Ollama model")
+def _front_matter_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+        return value[1:-1]
     return value
 
 
-def _agent_instructions(agent_id: str) -> str:
-    """Load an agent's editable Markdown body from the mounted definitions directory."""
+def _agent_configuration(agent_id: str) -> dict[str, Any]:
+    """Load editable prompt and provider settings from a mounted agent definition."""
     definitions_dir = Path(os.environ.get("AGENT_DEFINITIONS_DIR", "/app/agents"))
     for definition_path in sorted(definitions_dir.glob("*.md")):
         try:
@@ -52,16 +51,42 @@ def _agent_instructions(agent_id: str) -> str:
                 break
             key, separator, value = line.partition(":")
             if separator:
-                metadata[key.strip()] = value.strip()
+                metadata[key.strip()] = _front_matter_value(value)
         if metadata.get("id") == agent_id:
             prompt = "\n".join(lines[body_start:]).strip()
             if prompt:
-                return prompt
+                provider = metadata.get("provider", "").lower()
+                model = metadata.get("model", "").strip()
+                if provider != "ollama" or not model or model == "none":
+                    raise RuntimeError(
+                        f"agent definition requires an Ollama model: {definition_path}"
+                    )
+                try:
+                    temperature = float(metadata.get("temperature", "0"))
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"agent temperature must be numeric: {definition_path}"
+                    ) from exc
+                if not 0 <= temperature <= 2:
+                    raise RuntimeError(
+                        f"agent temperature must be between 0 and 2: {definition_path}"
+                    )
+                return {
+                    "definition": str(definition_path),
+                    "instructions": prompt,
+                    "model": model,
+                    "temperature": temperature,
+                    "timeout_seconds": _positive_integer(
+                        metadata.get("timeout_seconds", "120"), "agent timeout_seconds"
+                    ),
+                }
             raise RuntimeError(f"agent definition is empty: {definition_path}")
     raise RuntimeError(f"agent definition is unavailable: {agent_id} in {definitions_dir}")
 
 
-def _ollama_json(model: str, instructions: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _ollama_json(
+    model: str, instructions: str, payload: dict[str, Any], *, temperature: float, timeout: int
+) -> dict[str, Any]:
     """Request strict JSON from a local Ollama model without sending credentials."""
     request_payload = {
         "model": model,
@@ -74,7 +99,7 @@ def _ollama_json(model: str, instructions: str, payload: dict[str, Any]) -> dict
                 "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
             },
         ],
-        "options": {"temperature": 0},
+        "options": {"temperature": temperature},
     }
     request = Request(
         _ollama_chat_url(os.environ["OLLAMA_BASE_URL"]),
@@ -83,7 +108,7 @@ def _ollama_json(model: str, instructions: str, payload: dict[str, Any]) -> dict
         method="POST",
     )
     try:
-        with urlopen(request, timeout=_request_timeout()) as response:  # noqa: S310 -- local endpoint
+        with urlopen(request, timeout=timeout) as response:  # noqa: S310 -- local endpoint
             response_payload = json.load(response)
     except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Ollama request failed: {exc}") from exc
@@ -288,24 +313,34 @@ def run_planning() -> int:
         if not items:
             report["status"] = "no_work"
         else:
-            architect_model = _model("OLLAMA_ARCHITECT_MODEL")
-            critic_model = _model("OLLAMA_CRITIC_MODEL")
-            report["architect_model"] = architect_model
-            report["critic_model"] = critic_model
+            architect = _agent_configuration("senior_architect")
+            critic = _agent_configuration("senior_architect_critic")
+            report["architect_agent"] = {
+                key: architect[key]
+                for key in ("definition", "model", "temperature", "timeout_seconds")
+            }
+            report["critic_agent"] = {
+                key: critic[key]
+                for key in ("definition", "model", "temperature", "timeout_seconds")
+            }
             expected_ids = {item["id"] for item in items}
             architect_plan = _validate_architect_plan(
                 _ollama_json(
-                    architect_model,
-                    _agent_instructions("senior_architect"),
+                    str(architect["model"]),
+                    str(architect["instructions"]),
                     {"work_items": items},
+                    temperature=float(architect["temperature"]),
+                    timeout=int(architect["timeout_seconds"]),
                 ),
                 expected_ids,
             )
             critique = _validate_critic_response(
                 _ollama_json(
-                    critic_model,
-                    _agent_instructions("senior_architect_critic"),
+                    str(critic["model"]),
+                    str(critic["instructions"]),
                     {"work_items": items, "architect_plan": architect_plan},
+                    temperature=float(critic["temperature"]),
+                    timeout=int(critic["timeout_seconds"]),
                 ),
                 expected_ids,
             )

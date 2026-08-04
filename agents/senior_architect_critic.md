@@ -2,6 +2,10 @@
 id: senior_architect_critic
 status: active
 execution: llm
+provider: ollama
+model: qwen3.6:27b
+temperature: "0"
+timeout_seconds: "180"
 ---
 
 # Senior Architect Critic
@@ -15,7 +19,7 @@ Independently validates the architect's plan against the original PR/security in
 
 ## Activation prerequisite
 
-Requires `OLLAMA_CRITIC_MODEL` to name an installed Ollama model. It validates the generated
+Requires its mounted front matter to name an installed Ollama model. It validates the generated
 plan against the same immutable work-item list and cannot modify that plan.
 
 ## Authority

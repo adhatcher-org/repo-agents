@@ -45,6 +45,8 @@ def _agent_definitions() -> list[dict[str, str]]:
                 "id": metadata.get("id", definition_path.stem),
                 "status": metadata.get("status", "unknown"),
                 "execution": metadata.get("execution", "unknown"),
+                "provider": metadata.get("provider", "none"),
+                "model": metadata.get("model", "none"),
                 "definition": str(definition_path),
             }
         )

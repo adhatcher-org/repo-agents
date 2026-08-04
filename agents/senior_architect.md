@@ -2,6 +2,10 @@
 id: senior_architect
 status: active
 execution: llm
+provider: ollama
+model: qwen3.6:35b
+temperature: "0"
+timeout_seconds: "180"
 ---
 
 # Senior Architect
@@ -10,8 +14,8 @@ Will convert the team-lead briefing into a remediation plan that maps every PR a
 
 ## Activation prerequisite
 
-Requires `OLLAMA_ARCHITECT_MODEL` to name an installed Ollama model. It consumes only the
-latest passed inventory and writes a proposed plan; it does not access repository checkouts.
+Requires its mounted front matter to name an installed Ollama model. It consumes only the latest
+passed inventory and writes a proposed plan; it does not access repository checkouts.
 
 ## Authority
 

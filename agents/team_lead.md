@@ -2,6 +2,8 @@
 id: team_lead
 status: active
 execution: deterministic
+provider: none
+model: none
 ---
 
 # Team Lead

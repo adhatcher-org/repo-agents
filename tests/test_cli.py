@@ -105,6 +105,8 @@ def test_agent_definitions_are_discovered(monkeypatch: pytest.MonkeyPatch, tmp_p
             "id": "team",
             "status": "active",
             "execution": "deterministic",
+            "provider": "none",
+            "model": "none",
             "definition": str(tmp_path / "team.md"),
         }
     ]
@@ -119,29 +121,14 @@ def test_agent_definitions_skip_unreadable_and_default_missing_metadata(
     assert cli._agent_definitions()[0]["status"] == "unknown"
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [(None, 120), ("15", 15)],
-)
-def test_planning_request_timeout_defaults_and_accepts_positive_integers(
-    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: int
-) -> None:
-    if value is None:
-        monkeypatch.delenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", raising=False)
-    else:
-        monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", value)
-
-    assert planning._request_timeout() == expected
+def test_planning_timeout_accepts_positive_integer() -> None:
+    assert planning._positive_integer("15", "timeout_seconds") == 15
 
 
 @pytest.mark.parametrize("value", ["invalid", "0"])
-def test_planning_request_timeout_rejects_invalid_values(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
-    monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", value)
-
-    with pytest.raises(RuntimeError, match="OLLAMA_REQUEST_TIMEOUT_SECONDS"):
-        planning._request_timeout()
+def test_planning_timeout_rejects_invalid_values(value: str) -> None:
+    with pytest.raises(RuntimeError, match="timeout_seconds"):
+        planning._positive_integer(value, "timeout_seconds")
 
 
 def test_ollama_json_posts_structured_request_and_decodes_json(
@@ -155,47 +142,75 @@ def test_ollama_json_posts_structured_request_and_decodes_json(
         return _Response({"message": {"content": '{"summary":"ok"}'}})
 
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://ollama:11434/")
-    monkeypatch.setenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "5")
     monkeypatch.setattr(planning, "urlopen", fake_urlopen)
 
-    assert planning._ollama_json("architect", "instructions", {"work_items": []}) == {
-        "summary": "ok"
-    }
+    assert planning._ollama_json(
+        "architect", "instructions", {"work_items": []}, temperature=0, timeout=5
+    ) == {"summary": "ok"}
     request = captured["request"]
     assert isinstance(request, type(Request("http://example.test")))
     assert request.full_url == "http://ollama:11434/api/chat"
     assert captured["timeout"] == 5
 
 
-def test_agent_instructions_reads_markdown_body_from_mounted_definition(
+def test_agent_configuration_reads_prompt_and_model_from_mounted_definition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     (tmp_path / "architect.md").write_text(
-        "---\nid: senior_architect\nstatus: active\n---\n# Editable prompt\n\nReturn JSON.\n",
+        '---\nid: senior_architect\nprovider: ollama\nmodel: architect\ntemperature: "0"\n'
+        'timeout_seconds: "15"\n---\n# Editable prompt\n\nReturn JSON.\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
 
-    assert planning._agent_instructions("senior_architect") == "# Editable prompt\n\nReturn JSON."
+    assert planning._agent_configuration("senior_architect") == {
+        "definition": str(tmp_path / "architect.md"),
+        "instructions": "# Editable prompt\n\nReturn JSON.",
+        "model": "architect",
+        "temperature": 0.0,
+        "timeout_seconds": 15,
+    }
 
 
-def test_agent_instructions_rejects_missing_definition(
+def test_agent_configuration_rejects_missing_definition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
 
     with pytest.raises(RuntimeError, match="unavailable"):
-        planning._agent_instructions("senior_architect")
+        planning._agent_configuration("senior_architect")
 
 
-def test_agent_instructions_rejects_empty_definition(
+def test_agent_configuration_rejects_empty_definition(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    (tmp_path / "architect.md").write_text("---\nid: senior_architect\n---\n", encoding="utf-8")
+    (tmp_path / "architect.md").write_text(
+        "---\nid: senior_architect\nprovider: ollama\nmodel: architect\n---\n", encoding="utf-8"
+    )
     monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
 
     with pytest.raises(RuntimeError, match="empty"):
-        planning._agent_instructions("senior_architect")
+        planning._agent_configuration("senior_architect")
+
+
+@pytest.mark.parametrize(
+    ("front_matter", "message"),
+    [
+        ("provider: none\nmodel: none", "requires an Ollama model"),
+        ("provider: ollama\nmodel: architect\ntemperature: high", "temperature must be numeric"),
+        ("provider: ollama\nmodel: architect\ntemperature: 3", "temperature must be between"),
+    ],
+)
+def test_agent_configuration_rejects_invalid_model_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, front_matter: str, message: str
+) -> None:
+    (tmp_path / "architect.md").write_text(
+        f"---\nid: senior_architect\n{front_matter}\n---\nPrompt\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("AGENT_DEFINITIONS_DIR", str(tmp_path))
+
+    with pytest.raises(RuntimeError, match=message):
+        planning._agent_configuration("senior_architect")
 
 
 @pytest.mark.parametrize(
@@ -213,7 +228,7 @@ def test_ollama_json_rejects_invalid_model_responses(
     monkeypatch.setattr(planning, "urlopen", lambda *_args, **_kwargs: _Response(payload))
 
     with pytest.raises(RuntimeError, match=message):
-        planning._ollama_json("architect", "instructions", {})
+        planning._ollama_json("architect", "instructions", {}, temperature=0, timeout=5)
 
 
 def test_ollama_json_wraps_transport_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -225,7 +240,7 @@ def test_ollama_json_wraps_transport_failure(monkeypatch: pytest.MonkeyPatch) ->
     )
 
     with pytest.raises(RuntimeError, match="Ollama request failed"):
-        planning._ollama_json("architect", "instructions", {})
+        planning._ollama_json("architect", "instructions", {}, temperature=0, timeout=5)
 
 
 @pytest.mark.parametrize(
@@ -306,13 +321,12 @@ def test_run_planning_persists_blocked_report_when_models_are_missing(
     }
     (tmp_path / "latest-inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
-    monkeypatch.delenv("OLLAMA_ARCHITECT_MODEL", raising=False)
 
     assert planning.run_planning() == 1
 
     report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
     assert report["status"] == "blocked"
-    assert "OLLAMA_ARCHITECT_MODEL" in report["error"]
+    assert "agent definition is unavailable" in report["error"]
     assert json.loads(capsys.readouterr().out)["event"] == "planning_completed"
 
 
@@ -333,9 +347,17 @@ def test_run_planning_requires_independent_approved_critic(
     }
     (tmp_path / "latest-inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("OLLAMA_ARCHITECT_MODEL", "architect")
-    monkeypatch.setenv("OLLAMA_CRITIC_MODEL", "critic")
-    monkeypatch.setattr(planning, "_agent_instructions", lambda _agent_id: "prompt")
+    monkeypatch.setattr(
+        planning,
+        "_agent_configuration",
+        lambda agent_id: {
+            "definition": f"/agents/{agent_id}.md",
+            "instructions": "prompt",
+            "model": "architect" if agent_id == "senior_architect" else "critic",
+            "temperature": 0.0,
+            "timeout_seconds": 15,
+        },
+    )
     responses = iter(
         [
             {
@@ -358,13 +380,13 @@ def test_run_planning_requires_independent_approved_critic(
             },
         ]
     )
-    monkeypatch.setattr(planning, "_ollama_json", lambda *_args: next(responses))
+    monkeypatch.setattr(planning, "_ollama_json", lambda *_args, **_kwargs: next(responses))
 
     assert planning.run_planning() == 0
 
     report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
     assert report["status"] == "approved"
-    assert report["architect_model"] == "architect"
+    assert report["architect_agent"]["model"] == "architect"
     assert report["critic"]["verdict"] == "approved"
 
 

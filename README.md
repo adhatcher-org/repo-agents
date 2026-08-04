@@ -26,18 +26,11 @@ requires the critic model to validate coverage of every open PR, security alert,
 security source. It writes both JSON and Markdown reports under `data/runs/` and updates
 `latest-architect-plan.json` and `latest-architect-plan.md`.
 
-Configure two installed local models in the Unraid Compose stack or `.env` file:
-
-```dotenv
-OLLAMA_ARCHITECT_MODEL=YOUR_PLANNING_MODEL
-OLLAMA_CRITIC_MODEL=YOUR_CRITIC_MODEL
-OLLAMA_REQUEST_TIMEOUT_SECONDS=120
-```
-
-The mounted `agents/senior_architect.md` and `agents/senior_architect_critic.md` files are the
-live prompts. You can tune their role instructions and output guidance without rebuilding the
-image; rerun the command below to use the edited definitions. The application still rejects an
-incomplete architect response or critic coverage, regardless of prompt content.
+Every agent definition is a mounted, live configuration file. Its front matter declares the role's
+provider, model, temperature, and timeout; its Markdown body is the prompt. Tune either without
+rebuilding the image. The architect and critic must each declare `provider: ollama`, a non-empty
+`model`, `temperature`, and `timeout_seconds`. The application records the selected definitions and
+model settings in every plan artifact, while still rejecting incomplete architect or critic output.
 
 Run the stage manually after reviewing the inventory:
 
