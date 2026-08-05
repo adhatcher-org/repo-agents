@@ -3,7 +3,7 @@ id: senior_architect
 status: active
 execution: llm
 provider: ollama
-model: qwen3.6:35b
+model: qwen3.6:27b
 temperature: "0"
 timeout_seconds: "180"
 ---

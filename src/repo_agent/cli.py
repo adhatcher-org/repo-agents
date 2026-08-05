@@ -16,6 +16,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from repo_agent import __version__
+from repo_agent.engineering import run_engineer_handoff
 from repo_agent.planning import run_planning
 
 
@@ -397,8 +398,18 @@ def daemon() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(prog="repo-agent")
     parser.add_argument(
-        "command", choices=("agents", "daemon", "health", "plan-once", "run-once", "version")
+        "command",
+        choices=(
+            "agents",
+            "daemon",
+            "engineer-handoff",
+            "health",
+            "plan-once",
+            "run-once",
+            "version",
+        ),
     )
+    parser.add_argument("--item", help="exact approved work-item ID for engineer-handoff")
     args = parser.parse_args()
 
     if args.command == "version":
@@ -411,6 +422,10 @@ def main() -> None:
         sys.exit(run_inventory())
     if args.command == "plan-once":
         sys.exit(run_planning())
+    if args.command == "engineer-handoff":
+        if not args.item:
+            parser.error("engineer-handoff requires --item <approved-work-item-id>")
+        sys.exit(run_engineer_handoff(args.item))
     if args.command == "daemon":
         sys.exit(daemon())
     sys.exit(health())

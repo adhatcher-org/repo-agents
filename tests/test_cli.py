@@ -10,7 +10,7 @@ from urllib.request import Request
 
 import pytest
 
-from repo_agent import cli, planning
+from repo_agent import cli, engineering, planning
 
 
 class _Response:
@@ -406,6 +406,132 @@ def test_run_planning_records_no_work_without_calling_ollama(
 
     report = json.loads((tmp_path / "latest-architect-plan.json").read_text(encoding="utf-8"))
     assert report["status"] == "no_work"
+
+
+def test_engineer_handoff_requires_a_selected_item_from_an_approved_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plan = {
+        "status": "approved",
+        "critic": {"verdict": "approved"},
+        "work_items": [
+            {
+                "id": "owner/repo:code_scanning:7",
+                "repository": "owner/repo",
+                "kind": "code_scanning",
+                "title": "Stack trace exposure",
+            }
+        ],
+        "architect_plan": {
+            "items": [
+                {
+                    "id": "owner/repo:code_scanning:7",
+                    "disposition": "remediate",
+                    "rationale": "Avoid leaking internal details.",
+                    "acceptance_criteria": ["Tests pass"],
+                }
+            ]
+        },
+    }
+    metadata_path = tmp_path / "repo-info.yml"
+    metadata_path.write_text(
+        "repositories:\n"
+        "  - slug: owner/repo\n"
+        "    path: /work/repo\n"
+        "    default_branch: main\n"
+        "    architecture_docs: [docs/architecture.md]\n"
+        "    quality_gates: {test: make test}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "latest-architect-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(metadata_path))
+
+    assert engineering.run_engineer_handoff("owner/repo:code_scanning:7") == 0
+
+    report = json.loads((tmp_path / "latest-engineer-handoff.json").read_text(encoding="utf-8"))
+    assert report["status"] == "ready_for_implementation"
+    assert report["repository"]["path"] == "/work/repo"
+    assert report["architect_decision"]["acceptance_criteria"] == ["Tests pass"]
+
+
+def test_engineer_handoff_blocks_unconfigured_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plan = {
+        "status": "approved",
+        "critic": {"verdict": "approved"},
+        "work_items": [
+            {"id": "owner/repo:pr:7", "repository": "owner/repo", "kind": "open_pull_request"}
+        ],
+        "architect_plan": {"items": [{"id": "owner/repo:pr:7"}]},
+    }
+    metadata_path = tmp_path / "repo-info.yml"
+    metadata_path.write_text("repositories: []\n", encoding="utf-8")
+    (tmp_path / "latest-architect-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(metadata_path))
+
+    assert engineering.run_engineer_handoff("owner/repo:pr:7") == 1
+
+    report = json.loads((tmp_path / "latest-engineer-handoff.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "not configured" in report["error"]
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("[not-a-mapping]", "repositories list"),
+        ("repositories:\n  - slug: owner/repo\n  - slug: owner/repo\n", "duplicate slug"),
+        ("repositories: [", "not valid YAML"),
+    ],
+)
+def test_repository_metadata_validation_rejects_invalid_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    metadata_path = tmp_path / "repo-info.yml"
+    metadata_path.write_text(contents, encoding="utf-8")
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(metadata_path))
+
+    with pytest.raises(RuntimeError, match=message):
+        engineering._load_repository_info()
+
+
+def test_repository_metadata_validation_reports_missing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(tmp_path / "missing.yml"))
+
+    with pytest.raises(RuntimeError, match="metadata is missing"):
+        engineering._load_repository_info()
+
+
+@pytest.mark.parametrize(
+    ("plan", "message"),
+    [
+        ({"status": "blocked"}, "status approved"),
+        ({"status": "approved", "critic": {"verdict": "changes_requested"}}, "critic verdict"),
+        ({"status": "approved", "critic": {"verdict": "approved"}}, "architect items"),
+        (
+            {
+                "status": "approved",
+                "critic": {"verdict": "approved"},
+                "architect_plan": {"items": []},
+                "work_items": [],
+            },
+            "not present",
+        ),
+    ],
+)
+def test_approved_item_rejects_unapproved_or_unknown_inputs(
+    plan: dict[str, object], message: str
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        engineering._approved_item("owner/repo:pr:7", plan)
 
 
 def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) -> None:
