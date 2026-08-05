@@ -62,6 +62,35 @@ quality gates, and PR policy. Keep it on the existing read-only `/config` mount.
 implementation command is enabled, mount a dedicated writable `/work` directory containing only the
 selected repository or a disposable worktree—not the whole NAS projects directory.
 
+## Isolated engineer service
+
+`repo-agent-engineer` is a profile-only, one-shot service. It is excluded from a normal
+`docker compose up -d`, receives the write-capable `se-gh-token` directly (not the controller's
+whole secrets directory), and can write only the Bourbonbook worktree mounted at
+`/work/bourbonbook`. Its initial command is a preflight: it verifies that the selected item and a
+Git checkout exist, then re-runs the read-only handoff inside the isolated runtime. The future
+implementation command will replace this preflight after its write controls are implemented.
+
+Create the dedicated host workspace first; do not point it at the shared projects directory. On
+Unraid, give the container user (UID 99/GID 100) ownership so it can create the clone:
+
+```bash
+mkdir -p /mnt/user/app_cache/repo-agent/work/bourbonbook
+chown -R nobody:users /mnt/user/app_cache/repo-agent/work
+```
+
+Then run the isolated preflight manually from the Compose project directory:
+
+```bash
+ENGINEER_ITEM_ID=adhatcher-org/bourbonbook:pr:53 \
+  docker compose --profile engineer run --rm repo-agent-engineer
+```
+
+If the workspace is empty, the service uses `se-gh-token` to clone only
+`adhatcher-org/bourbonbook`; it never overwrites a non-empty non-Git directory. The command fails
+safely if the ID is absent or the workspace cannot become a Git checkout. The daily `repo-agent`
+controller remains running without access to `se-gh-token`.
+
 ## Run through Unraid Compose
 
 After the first GitHub Actions release, Compose pulls the published image:
