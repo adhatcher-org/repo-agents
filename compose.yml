@@ -44,6 +44,57 @@ services:
       start_period: 30s
     command: ["repo-agent", "daemon"]
 
+  repo-agent-engineer:
+    image: ghcr.io/adhatcher-org/repo-agent:latest
+    container_name: repo-agent-engineer
+    profiles: ["engineer"]
+    restart: "no"
+    pull_policy: always
+    user: "99:100"
+    environment:
+      TZ: America/New_York
+      OLLAMA_BASE_URL: http://ollama:11434
+      AGENT_CONFIG: /config/repos.yml
+      AGENT_REPOSITORY_INFO: /config/repo-info.yml
+      AGENT_STATE_DIR: /data
+      AGENT_DEFINITIONS_DIR: /agents
+      GITHUB_TOKEN_FILE: /run/engineer-secrets/github-token
+      ENGINEER_WORKSPACE: /work/bourbonbook
+      HOME: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+    volumes:
+      - /mnt/user/app_cache/repo-agent/data:/data
+      - /mnt/user/app_cache/repo-agent/agents:/agents:ro
+      - /mnt/user/app_cache/repo-agent/config:/config:ro
+      - /mnt/user/app_cache/repo-agent/logs:/logs
+      - /mnt/user/app_cache/repo-agent/secrets/se-gh-token:/run/engineer-secrets/github-token:ro
+      - /mnt/user/app_cache/repo-agent/work/bourbonbook:/work/bourbonbook:rw
+    networks:
+      - proxy_net
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 2g
+    command:
+      - sh
+      - -ec
+      - >-
+        test -n "$$ENGINEER_ITEM_ID";
+        if ! test -d "$$ENGINEER_WORKSPACE/.git"; then
+          test -z "$$(find "$$ENGINEER_WORKSPACE" -mindepth 1 -maxdepth 1 -print -quit)";
+          GH_TOKEN="$$(cat "$$GITHUB_TOKEN_FILE")" gh repo clone
+          adhatcher-org/bourbonbook "$$ENGINEER_WORKSPACE";
+        fi;
+        test -d "$$ENGINEER_WORKSPACE/.git";
+        exec repo-agent engineer-handoff --item "$$ENGINEER_ITEM_ID"
+
 networks:
   proxy_net:
     external: true
