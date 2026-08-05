@@ -15,8 +15,9 @@ docker exec repo-agent repo-agent agents
 ```
 
 `team_lead`, `senior_architect`, and `senior_architect_critic` are active in the read-only
-inventory/planning milestone. The software-engineer, test, PR-review, and CI-monitor roles remain
-deliberately planned until their isolated write and verification boundaries are implemented.
+inventory/planning milestone. The software engineer can now prepare one selected, approved item
+for a later execution stage. The test, PR-review, and CI-monitor roles remain deliberately planned
+until their isolated write and verification boundaries are implemented.
 
 ## Architect and critic planning stage
 
@@ -42,6 +43,24 @@ docker exec repo-agent repo-agent plan-once
 the inventory was not successful, a model was not configured, Ollama failed, or either model did
 not return the required complete JSON contract. This stage never changes repositories, documents,
 branches, pull requests, or alerts.
+
+## Senior software engineer handoff
+
+The handoff command requires an exact work-item ID from the latest **approved** architect plan. It
+copies only that item, its acceptance criteria, and its editable repository execution metadata into
+`engineer-handoff.json` and `engineer-handoff.md`. It does not clone, mount, or modify a repository;
+missing repository metadata is a deliberate blocker.
+
+```bash
+docker exec repo-agent repo-agent engineer-handoff \
+  --item adhatcher-org/bourbonbook:pr:53
+```
+
+Repository metadata is read from `AGENT_REPOSITORY_INFO` (default
+`/config/repo-info.yml`). It maps each slug to its future isolated workspace, architecture documents,
+quality gates, and PR policy. Keep it on the existing read-only `/config` mount. Before any future
+implementation command is enabled, mount a dedicated writable `/work` directory containing only the
+selected repository or a disposable worktree—not the whole NAS projects directory.
 
 ## Run through Unraid Compose
 

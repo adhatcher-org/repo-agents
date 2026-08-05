@@ -7,7 +7,9 @@ name = "repo-agent"
 version = "0.1.0"
 description = "Read-only GitHub inventory controller for repository maintenance agents"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "PyYAML>=6.0.2",
+]
 
 [project.scripts]
 repo-agent = "repo_agent.cli:main"

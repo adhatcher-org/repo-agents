@@ -16,6 +16,8 @@ services:
       HOME: /tmp
       XDG_CACHE_HOME: /tmp/.cache
       XDG_CONFIG_HOME: /tmp/.config
+      OLLAMA_ARCHITECT_MODEL: "qwen3.6:27b"
+      OLLAMA_CRITIC_MODEL: "qwen3.6:27b"
     volumes:
       - /mnt/user/app_cache/repo-agent/data:/data
       - /mnt/user/app_cache/repo-agent/agents:/agents:ro
