@@ -446,6 +446,7 @@ def test_engineer_handoff_requires_a_selected_item_from_an_approved_plan(
     (tmp_path / "latest-architect-plan.json").write_text(json.dumps(plan), encoding="utf-8")
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(metadata_path))
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/work")
 
     assert engineering.run_engineer_handoff("owner/repo:code_scanning:7") == 0
 
@@ -532,6 +533,146 @@ def test_approved_item_rejects_unapproved_or_unknown_inputs(
 ) -> None:
     with pytest.raises(RuntimeError, match=message):
         engineering._approved_item("owner/repo:pr:7", plan)
+
+
+@pytest.mark.parametrize(
+    ("repository", "workspace"),
+    [
+        ("adhatcher-org/bourbonbook", "/projects/bourbonbook"),
+        ("owner/repo", "/projects/nested/repo"),
+    ],
+)
+def test_workspace_path_is_configured_and_contained(
+    monkeypatch: pytest.MonkeyPatch, repository: str, workspace: str
+) -> None:
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+
+    assert engineering._workspace_path(repository, {"path": workspace}) == Path(workspace)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "message"),
+    [
+        ({}, "requires a path"),
+        ({"path": "/other/repo"}, "must be inside"),
+        ({"path": 1}, "requires a path"),
+    ],
+)
+def test_workspace_path_rejects_missing_or_outside_configuration(
+    monkeypatch: pytest.MonkeyPatch, metadata: dict[str, object], message: str
+) -> None:
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+    with pytest.raises(RuntimeError, match=message):
+        engineering._workspace_path("owner/repo", metadata)
+
+
+def test_workspace_path_requires_absolute_repository_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "projects")
+
+    with pytest.raises(RuntimeError, match="must be an absolute path"):
+        engineering._workspace_path("owner/repo", {"path": "/projects/repo"})
+
+
+def test_engineer_preflight_prepares_only_the_handoff_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    handoff = {
+        "status": "ready_for_implementation",
+        "work_item": {"id": "owner/repo:pr:7", "repository": "owner/repo"},
+        "repository": {"path": "/projects/repo"},
+    }
+    (tmp_path / "latest-engineer-handoff.json").write_text(json.dumps(handoff), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        engineering, "_prepare_workspace", lambda repository, metadata: Path("/projects/repo")
+    )
+
+    assert engineering.run_engineer_preflight("owner/repo:pr:7") == 0
+
+    report = json.loads((tmp_path / "latest-engineer-preflight.json").read_text(encoding="utf-8"))
+    assert report["status"] == "ready_for_coding"
+    assert report["repository"] == "owner/repo"
+    assert report["workspace_path"] == "/projects/repo"
+
+
+def test_engineer_preflight_blocks_mismatched_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    handoff = {
+        "status": "ready_for_implementation",
+        "work_item": {"id": "owner/repo:pr:8", "repository": "owner/repo"},
+    }
+    (tmp_path / "latest-engineer-handoff.json").write_text(json.dumps(handoff), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+
+    assert engineering.run_engineer_preflight("owner/repo:pr:7") == 1
+
+    report = json.loads((tmp_path / "latest-engineer-preflight.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "does not match" in report["error"]
+
+
+def test_engineer_preflight_blocks_missing_repository_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    handoff = {
+        "status": "ready_for_implementation",
+        "work_item": {"id": "owner/repo:pr:7", "repository": "owner/repo"},
+    }
+    (tmp_path / "latest-engineer-handoff.json").write_text(json.dumps(handoff), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+
+    assert engineering.run_engineer_preflight("owner/repo:pr:7") == 1
+
+    report = json.loads((tmp_path / "latest-engineer-preflight.json").read_text(encoding="utf-8"))
+    assert "does not contain repository metadata" in report["error"]
+
+
+def test_prepare_workspace_inspects_clean_configured_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+    workspace = tmp_path / "bourbonbook"
+    (workspace / ".git").mkdir(parents=True)
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", str(tmp_path))
+
+    def fake_run(arguments: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["arguments"] = arguments
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(engineering, "run", fake_run)
+
+    assert engineering._prepare_workspace("owner/repo", {"path": str(workspace)}) == workspace
+    assert captured["arguments"] == ["git", "-C", str(workspace), "status", "--porcelain"]
+
+
+def test_prepare_workspace_rejects_missing_checkout_and_dirty_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", str(tmp_path))
+    workspace = tmp_path / "repo"
+    with pytest.raises(RuntimeError, match="checkout is unavailable"):
+        engineering._prepare_workspace("owner/repo", {"path": str(workspace)})
+
+    (workspace / ".git").mkdir(parents=True)
+    monkeypatch.setattr(
+        engineering, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=" M app.py\n")
+    )
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        engineering._prepare_workspace("owner/repo", {"path": str(workspace)})
+
+
+def test_prepare_workspace_reports_git_status_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    (workspace / ".git").mkdir(parents=True)
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", str(tmp_path))
+    error = CalledProcessError(1, ["git"], output="", stderr="unavailable")
+    monkeypatch.setattr(engineering, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+
+    with pytest.raises(RuntimeError, match="failed to inspect repository checkout: unavailable"):
+        engineering._prepare_workspace("owner/repo", {"path": str(workspace)})
 
 
 def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) -> None:
