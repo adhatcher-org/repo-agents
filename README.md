@@ -66,18 +66,14 @@ selected repository or a disposable worktree—not the whole NAS projects direct
 
 `repo-agent-engineer` is a profile-only, one-shot service. It is excluded from a normal
 `docker compose up -d`, receives the write-capable `se-gh-token` directly (not the controller's
-whole secrets directory), and can write only the Bourbonbook worktree mounted at
-`/work/bourbonbook`. Its initial command is a preflight: it verifies that the selected item and a
-Git checkout exist, then re-runs the read-only handoff inside the isolated runtime. The future
-implementation command will replace this preflight after its write controls are implemented.
+whole secrets directory), and receives the configured repository root at `/projects`. The selected
+repository is taken from the approved handoff and its editable `repo-info.yml` entry; its path must
+remain contained under `/projects`.
 
-Create the dedicated host workspace first; do not point it at the shared projects directory. On
-Unraid, give the container user (UID 99/GID 100) ownership so it can create the clone:
-
-```bash
-mkdir -p /mnt/user/app_cache/repo-agent/work/bourbonbook
-chown -R nobody:users /mnt/user/app_cache/repo-agent/work
-```
+For Bourbonbook, retain the configured path `/projects/bourbonbook`, backed by
+`/mnt/user/Aaron_NAS/projects/bourbonbook` on Unraid. The preflight verifies that this is a Git
+checkout and has no uncommitted changes; a branch protects committed work but cannot protect
+uncommitted changes from a branch switch or an automated edit.
 
 Then run the isolated preflight manually from the Compose project directory:
 
@@ -86,10 +82,10 @@ ENGINEER_ITEM_ID=adhatcher-org/bourbonbook:pr:53 \
   docker compose --profile engineer run --rm repo-agent-engineer
 ```
 
-If the workspace is empty, the service uses `se-gh-token` to clone only
-`adhatcher-org/bourbonbook`; it never overwrites a non-empty non-Git directory. The command fails
-safely if the ID is absent or the workspace cannot become a Git checkout. The daily `repo-agent`
-controller remains running without access to `se-gh-token`.
+The preflight does not clone or change a repository. It fails safely if the item is absent, the
+handoff does not match, the configured checkout is unavailable, or it has uncommitted changes. It writes
+`latest-engineer-preflight.json` with `ready_for_coding` only after a valid isolated checkout exists.
+The daily `repo-agent` controller remains running without access to `se-gh-token`.
 
 ## Run through Unraid Compose
 

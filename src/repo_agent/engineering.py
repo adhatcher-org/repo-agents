@@ -6,6 +6,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from subprocess import CalledProcessError, run
 from typing import Any
 
 import yaml
@@ -13,6 +14,22 @@ import yaml
 
 def _repository_info_path() -> Path:
     return Path(os.environ.get("AGENT_REPOSITORY_INFO", "/config/repo-info.yml"))
+
+
+def _workspace_path(repository: str, metadata: dict[str, Any]) -> Path:
+    """Validate the configured checkout path is contained in the repository mount."""
+    configured_path = metadata.get("path")
+    if not isinstance(configured_path, str):
+        raise RuntimeError(f"repository metadata requires a path: {repository}")
+    root = Path(os.environ.get("ENGINEER_REPOSITORY_ROOT", "/projects"))
+    if not root.is_absolute():
+        raise RuntimeError("ENGINEER_REPOSITORY_ROOT must be an absolute path")
+    workspace = Path(configured_path)
+    try:
+        workspace.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"repository checkout must be inside {root}: {configured_path}") from exc
+    return workspace
 
 
 def _load_repository_info() -> dict[str, dict[str, Any]]:
@@ -104,7 +121,7 @@ def _markdown_report(report: dict[str, Any]) -> str:
     lines.extend(["", "## Repository execution contract", ""])
     lines.extend(
         [
-            f"- Workspace path: `{metadata.get('path', 'not configured')}`",
+            f"- Workspace path: `{report['workspace_path']}`",
             f"- Default branch: `{metadata.get('default_branch', 'not configured')}`",
             "- Architecture documents: "
             + ", ".join(f"`{path}`" for path in metadata.get("architecture_docs", [])),
@@ -154,6 +171,7 @@ def run_engineer_handoff(item_id: str) -> int:
         report["work_item"] = source
         report["architect_decision"] = decision
         report["repository"] = metadata
+        report["workspace_path"] = str(_workspace_path(repository, metadata))
         report["engineer_agent"] = {"id": "senior_software_engineer"}
         report["status"] = "ready_for_implementation"
     except (OSError, RuntimeError, json.JSONDecodeError) as exc:
@@ -177,6 +195,80 @@ def run_engineer_handoff(item_id: str) -> int:
         json.dumps(
             {
                 "event": "engineer_handoff_completed",
+                "report": str(report_path),
+                "status": report["status"],
+            }
+        )
+    )
+    return 1 if report["status"] == "blocked" else 0
+
+
+def _prepare_workspace(repository: str, metadata: dict[str, Any]) -> Path:
+    """Verify the configured checkout is clean before a later branch-changing stage."""
+    workspace = _workspace_path(repository, metadata)
+    if not (workspace / ".git").is_dir():
+        raise RuntimeError(f"configured repository checkout is unavailable: {workspace}")
+    try:
+        status = run(
+            ["git", "-C", str(workspace), "status", "--porcelain"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except CalledProcessError as exc:
+        message = exc.stderr.strip() or exc.stdout.strip() or "unknown git status failure"
+        raise RuntimeError(f"failed to inspect repository checkout: {message}") from exc
+    if status.stdout.strip():
+        raise RuntimeError(f"configured repository checkout has uncommitted changes: {workspace}")
+    return workspace
+
+
+def run_engineer_preflight(item_id: str) -> int:
+    """Prepare one isolated checkout, without creating a branch or modifying application code."""
+    timestamp = datetime.now(UTC)
+    state_dir = Path(os.environ["AGENT_STATE_DIR"])
+    handoff_path = state_dir / "latest-engineer-handoff.json"
+    report: dict[str, Any] = {
+        "kind": "senior_software_engineer_preflight",
+        "started_at": timestamp.isoformat(),
+        "mode": "isolated_checkout_only",
+        "requested_item_id": item_id,
+        "handoff_path": str(handoff_path),
+        "status": "blocked",
+    }
+    try:
+        handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+        if not isinstance(handoff, dict) or handoff.get("status") != "ready_for_implementation":
+            raise RuntimeError("latest engineer handoff must be ready_for_implementation")
+        work_item = handoff.get("work_item")
+        if not isinstance(work_item, dict) or work_item.get("id") != item_id:
+            raise RuntimeError("latest engineer handoff does not match the requested work item")
+        repository = work_item.get("repository")
+        if not isinstance(repository, str):
+            raise RuntimeError("latest engineer handoff does not name a repository")
+        metadata = handoff.get("repository")
+        if not isinstance(metadata, dict):
+            raise RuntimeError("latest engineer handoff does not contain repository metadata")
+        workspace = _prepare_workspace(repository, metadata)
+        report["repository"] = repository
+        report["workspace_path"] = str(workspace)
+        report["status"] = "ready_for_coding"
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        report["error"] = str(exc)
+
+    report["completed_at"] = datetime.now(UTC).isoformat()
+    run_dir = state_dir / "runs" / timestamp.strftime("%Y%m%dT%H%M%SZ")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report_path = run_dir / "engineer-preflight.json"
+    report["report_path"] = str(report_path)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (state_dir / "latest-engineer-preflight.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "event": "engineer_preflight_completed",
                 "report": str(report_path),
                 "status": report["status"],
             }

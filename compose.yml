@@ -59,7 +59,7 @@ services:
       AGENT_STATE_DIR: /data
       AGENT_DEFINITIONS_DIR: /agents
       GITHUB_TOKEN_FILE: /run/engineer-secrets/github-token
-      ENGINEER_WORKSPACE: /work/bourbonbook
+      ENGINEER_REPOSITORY_ROOT: /projects
       HOME: /tmp
       XDG_CACHE_HOME: /tmp/.cache
       XDG_CONFIG_HOME: /tmp/.config
@@ -69,7 +69,7 @@ services:
       - /mnt/user/app_cache/repo-agent/config:/config:ro
       - /mnt/user/app_cache/repo-agent/logs:/logs
       - /mnt/user/app_cache/repo-agent/secrets/se-gh-token:/run/engineer-secrets/github-token:ro
-      - /mnt/user/app_cache/repo-agent/work/bourbonbook:/work/bourbonbook:rw
+      - /mnt/user/Aaron_NAS/projects:/projects:rw
     networks:
       - proxy_net
     read_only: true
@@ -87,13 +87,7 @@ services:
       - -ec
       - >-
         test -n "$$ENGINEER_ITEM_ID";
-        if ! test -d "$$ENGINEER_WORKSPACE/.git"; then
-          test -z "$$(find "$$ENGINEER_WORKSPACE" -mindepth 1 -maxdepth 1 -print -quit)";
-          GH_TOKEN="$$(cat "$$GITHUB_TOKEN_FILE")" gh repo clone
-          adhatcher-org/bourbonbook "$$ENGINEER_WORKSPACE";
-        fi;
-        test -d "$$ENGINEER_WORKSPACE/.git";
-        exec repo-agent engineer-handoff --item "$$ENGINEER_ITEM_ID"
+        exec repo-agent engineer-preflight --item "$$ENGINEER_ITEM_ID"
 
 networks:
   proxy_net:
