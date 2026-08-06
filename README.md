@@ -91,10 +91,15 @@ handoff does not match, the configured checkout is unavailable, or it has uncomm
 ## Senior engineer execution
 
 After a successful preflight, run the same profile-only service again with the exact same item ID.
-It consumes only `latest-engineer-preflight.json`, re-checks that the named checkout is clean, on its
-configured default branch, and exactly matches the local `origin/<default-branch>` ref. Only then does it
-create a deterministic `repo-agent/engineer-*` branch. The mounted `senior_software_engineer.md` definition
-returns a strictly validated JSON patch contract. Git checks every patch before applying it.
+For an existing GitHub pull-request item, it records that pull request and its architect decision as
+`existing_pull_request_ready_for_testing`, without invoking Ollama, inspecting Git, creating a branch, or
+changing files. This sends the PR's actual diff to the later test/review stages rather than attempting to
+recreate a Dependabot change from a generated patch.
+
+For remediation items, it re-checks that the named checkout is clean, on its configured default branch, and
+exactly matches the local `origin/<default-branch>` ref. Only then does it create a deterministic
+`repo-agent/engineer-*` branch. The mounted `senior_software_engineer.md` definition returns a strictly
+validated JSON patch contract. Git checks every patch before applying it.
 
 ```bash
 docker compose --profile engineer run --rm --no-deps \

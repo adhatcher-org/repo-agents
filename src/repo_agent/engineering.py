@@ -468,7 +468,7 @@ def _load_ready_preflight(
 
 
 def run_engineer_execute(item_id: str) -> int:
-    """Create one branch and apply validated model patches; never test, commit, or publish."""
+    """Route existing PRs to testing or apply validated patches for remediation work."""
     timestamp = datetime.now(UTC)
     state_dir = Path(os.environ["AGENT_STATE_DIR"])
     report: dict[str, Any] = {
@@ -481,61 +481,77 @@ def run_engineer_execute(item_id: str) -> int:
     }
     try:
         preflight, workspace, metadata = _load_ready_preflight(item_id, state_dir)
-        base_commit = _default_base(workspace, metadata)
-        branch = _branch_name(item_id, timestamp)
-        _git_output(workspace, ["switch", "-c", branch])
-        report.update(
-            {
-                "repository": preflight["work_item"].get("repository"),
-                "workspace_path": str(workspace),
-                "base_commit": base_commit,
-                "branch": branch,
-            }
-        )
-        agent = _agent_configuration("senior_software_engineer")
-        payload = {
-            "work_item": preflight["work_item"],
-            "architect_decision": preflight.get("architect_decision"),
-            "repository_metadata": {
-                "architecture_docs": metadata.get("architecture_docs", []),
-                "quality_gates": metadata.get("quality_gates", {}),
-            },
-            "repository_context": _repository_context(workspace, metadata),
-            "constraints": {
-                "create_or_update_only_patch_paths": True,
-                "do_not_run_commands": True,
-                "do_not_commit_or_publish": True,
-            },
-        }
-        response = _validate_engineer_response(
-            _ollama_json(
-                agent["model"],
-                agent["instructions"],
-                payload,
-                temperature=agent["temperature"],
-                timeout=agent["timeout_seconds"],
+        work_item = preflight["work_item"]
+        if work_item.get("kind") == "open_pull_request":
+            report.update(
+                {
+                    "mode": "existing_pull_request_no_repository_changes",
+                    "status": "existing_pull_request_ready_for_testing",
+                    "repository": work_item.get("repository"),
+                    "workspace_path": str(workspace),
+                    "work_item": work_item,
+                    "pull_request_url": work_item.get("url"),
+                    "architect_decision": preflight.get("architect_decision"),
+                }
             )
-        )
-        patches = response["patches"]
-        assert isinstance(patches, list)
-        applied = _apply_patches(workspace, patches)
-        report.update(
-            {
-                "status": "implementation_applied",
-                "engineer_agent": {
-                    "id": "senior_software_engineer",
-                    "definition": agent["definition"],
-                    "model": agent["model"],
-                    "temperature": agent["temperature"],
+        else:
+            base_commit = _default_base(workspace, metadata)
+            branch = _branch_name(item_id, timestamp)
+            _git_output(workspace, ["switch", "-c", branch])
+            report.update(
+                {
+                    "repository": work_item.get("repository"),
+                    "workspace_path": str(workspace),
+                    "base_commit": base_commit,
+                    "branch": branch,
+                }
+            )
+            agent = _agent_configuration("senior_software_engineer")
+            payload = {
+                "work_item": work_item,
+                "architect_decision": preflight.get("architect_decision"),
+                "repository_metadata": {
+                    "architecture_docs": metadata.get("architecture_docs", []),
+                    "quality_gates": metadata.get("quality_gates", {}),
                 },
-                "implementation_summary": response["implementation_summary"],
-                "files_to_change": response["files_to_change"],
-                "architecture_documents_to_update": response["architecture_documents_to_update"],
-                "test_strategy": response["test_strategy"],
-                "risks": response["risks"],
-                "applied_patches": applied,
+                "repository_context": _repository_context(workspace, metadata),
+                "constraints": {
+                    "create_or_update_only_patch_paths": True,
+                    "do_not_run_commands": True,
+                    "do_not_commit_or_publish": True,
+                },
             }
-        )
+            response = _validate_engineer_response(
+                _ollama_json(
+                    agent["model"],
+                    agent["instructions"],
+                    payload,
+                    temperature=agent["temperature"],
+                    timeout=agent["timeout_seconds"],
+                )
+            )
+            patches = response["patches"]
+            assert isinstance(patches, list)
+            applied = _apply_patches(workspace, patches)
+            report.update(
+                {
+                    "status": "implementation_applied",
+                    "engineer_agent": {
+                        "id": "senior_software_engineer",
+                        "definition": agent["definition"],
+                        "model": agent["model"],
+                        "temperature": agent["temperature"],
+                    },
+                    "implementation_summary": response["implementation_summary"],
+                    "files_to_change": response["files_to_change"],
+                    "architecture_documents_to_update": response[
+                        "architecture_documents_to_update"
+                    ],
+                    "test_strategy": response["test_strategy"],
+                    "risks": response["risks"],
+                    "applied_patches": applied,
+                }
+            )
     except (OSError, RuntimeError, json.JSONDecodeError) as exc:
         report["error"] = str(exc)
 

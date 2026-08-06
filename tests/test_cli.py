@@ -764,6 +764,51 @@ def test_engineer_execute_applies_validated_patches_after_preflight(
     assert "diff" not in json.dumps(report)
 
 
+def test_engineer_execute_sends_existing_pull_request_to_testing_without_side_effects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    work_item = {
+        "id": "owner/repo:pr:7",
+        "kind": "open_pull_request",
+        "repository": "owner/repo",
+        "title": "Bump dependency",
+        "url": "https://example.test/owner/repo/pull/7",
+    }
+    decision = {"id": work_item["id"], "disposition": "Approve"}
+    preflight = {
+        "status": "ready_for_coding",
+        "work_item": work_item,
+        "architect_decision": decision,
+        "repository_metadata": {"path": "/projects/repo", "default_branch": "main"},
+        "workspace_path": "/projects/repo",
+    }
+    (tmp_path / "latest-engineer-preflight.json").write_text(
+        json.dumps(preflight), encoding="utf-8"
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+
+    def unexpected(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("existing pull request execution must not call this function")
+
+    monkeypatch.setattr(engineering, "_default_base", unexpected)
+    monkeypatch.setattr(engineering, "_git_output", unexpected)
+    monkeypatch.setattr(engineering, "_agent_configuration", unexpected)
+    monkeypatch.setattr(engineering, "_repository_context", unexpected)
+    monkeypatch.setattr(engineering, "_ollama_json", unexpected)
+    monkeypatch.setattr(engineering, "_apply_patches", unexpected)
+
+    assert engineering.run_engineer_execute(work_item["id"]) == 0
+
+    report = json.loads((tmp_path / "latest-engineer-execution.json").read_text(encoding="utf-8"))
+    assert report["status"] == "existing_pull_request_ready_for_testing"
+    assert report["mode"] == "existing_pull_request_no_repository_changes"
+    assert report["work_item"] == work_item
+    assert report["pull_request_url"] == work_item["url"]
+    assert report["architect_decision"] == decision
+    assert "branch" not in report
+
+
 def test_engineer_execute_blocks_mismatched_preflight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
