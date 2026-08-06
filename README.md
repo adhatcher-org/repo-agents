@@ -58,9 +58,9 @@ docker exec repo-agent repo-agent engineer-handoff \
 
 Repository metadata is read from `AGENT_REPOSITORY_INFO` (default
 `/config/repo-info.yml`). It maps each slug to its future isolated workspace, architecture documents,
-quality gates, and PR policy. Keep it on the existing read-only `/config` mount. Before any future
-implementation command is enabled, mount a dedicated writable `/work` directory containing only the
-selected repository or a disposable worktree—not the whole NAS projects directory.
+quality gates, and PR policy. Keep it on the existing read-only `/config` mount. The daily controller
+does not mount repository code; the separate, profile-only engineer service receives the explicitly
+approved `/projects` mount only when an execution stage is run.
 
 ## Isolated engineer service
 
@@ -78,13 +78,35 @@ uncommitted changes from a branch switch or an automated edit.
 Then run the isolated preflight manually from the Compose project directory:
 
 ```bash
-ENGINEER_ITEM_ID=adhatcher-org/bourbonbook:pr:53 \
-  docker compose --profile engineer run --rm repo-agent-engineer
+docker compose --profile engineer run --rm --no-deps \
+  -e ENGINEER_ITEM_ID='adhatcher-org/bourbonbook:pr:53' \
+  --entrypoint repo-agent repo-agent-engineer \
+  engineer-preflight --item 'adhatcher-org/bourbonbook:pr:53'
 ```
 
 The preflight does not clone or change a repository. It fails safely if the item is absent, the
 handoff does not match, the configured checkout is unavailable, or it has uncommitted changes. It writes
 `latest-engineer-preflight.json` with `ready_for_coding` only after a valid isolated checkout exists.
+
+## Senior engineer execution
+
+After a successful preflight, run the same profile-only service again with the exact same item ID.
+It consumes only `latest-engineer-preflight.json`, re-checks that the named checkout is clean, on its
+configured default branch, and exactly matches the local `origin/<default-branch>` ref. Only then does it
+create a deterministic `repo-agent/engineer-*` branch. The mounted `senior_software_engineer.md` definition
+returns a strictly validated JSON patch contract. Git checks every patch before applying it.
+
+```bash
+docker compose --profile engineer run --rm --no-deps \
+  -e ENGINEER_ITEM_ID='OWNER/REPOSITORY:pr:NUMBER' \
+  repo-agent-engineer
+```
+
+The execution report is written to `latest-engineer-execution.json`. It records the base commit, branch,
+agent model/definition, changed paths, and SHA-256 digests of accepted patches—but never the token or patch
+contents. Execution deliberately does not run tests, commit, push, create a pull request, merge, or dismiss
+alerts. A later test-agent stage must validate the dirty feature branch before any publishing action.
+
 The daily `repo-agent` controller remains running without access to `se-gh-token`.
 
 ## Run through Unraid Compose

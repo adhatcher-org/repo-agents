@@ -16,7 +16,11 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 from repo_agent import __version__
-from repo_agent.engineering import run_engineer_handoff, run_engineer_preflight
+from repo_agent.engineering import (
+    run_engineer_execute,
+    run_engineer_handoff,
+    run_engineer_preflight,
+)
 from repo_agent.planning import run_planning
 
 
@@ -404,6 +408,7 @@ def main() -> None:
             "daemon",
             "engineer-handoff",
             "engineer-preflight",
+            "engineer-execute",
             "health",
             "plan-once",
             "run-once",
@@ -431,6 +436,10 @@ def main() -> None:
         if not args.item:
             parser.error("engineer-preflight requires --item <approved-work-item-id>")
         sys.exit(run_engineer_preflight(args.item))
+    if args.command == "engineer-execute":
+        if not args.item:
+            parser.error("engineer-execute requires --item <approved-work-item-id>")
+        sys.exit(run_engineer_execute(args.item))
     if args.command == "daemon":
         sys.exit(daemon())
     sys.exit(health())
