@@ -87,7 +87,7 @@ services:
       - -ec
       - >-
         test -n "$$ENGINEER_ITEM_ID";
-        exec repo-agent engineer-preflight --item "$$ENGINEER_ITEM_ID"
+        exec repo-agent engineer-execute --item "$$ENGINEER_ITEM_ID"
 
 networks:
   proxy_net:

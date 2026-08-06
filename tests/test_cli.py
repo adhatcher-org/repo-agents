@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from subprocess import CalledProcessError
 from types import SimpleNamespace
@@ -593,6 +594,8 @@ def test_engineer_preflight_prepares_only_the_handoff_repository(
     assert report["status"] == "ready_for_coding"
     assert report["repository"] == "owner/repo"
     assert report["workspace_path"] == "/projects/repo"
+    assert report["work_item"] == handoff["work_item"]
+    assert report["repository_metadata"] == handoff["repository"]
 
 
 def test_engineer_preflight_blocks_mismatched_handoff(
@@ -673,6 +676,264 @@ def test_prepare_workspace_reports_git_status_failure(
 
     with pytest.raises(RuntimeError, match="failed to inspect repository checkout: unavailable"):
         engineering._prepare_workspace("owner/repo", {"path": str(workspace)})
+
+
+def test_engineer_response_requires_safe_complete_patch_contract() -> None:
+    response = {
+        "implementation_summary": "Update the pinned dependency.",
+        "files_to_change": ["pyproject.toml"],
+        "architecture_documents_to_update": [],
+        "test_strategy": ["Run the project test target."],
+        "risks": [],
+        "patches": [
+            {
+                "path": "pyproject.toml",
+                "diff": "diff --git a/pyproject.toml b/pyproject.toml\n"
+                "--- a/pyproject.toml\n+++ b/pyproject.toml\n",
+            }
+        ],
+    }
+
+    assert engineering._validate_engineer_response(response) == response
+
+    response["patches"][0]["path"] = "../outside.py"
+    with pytest.raises(RuntimeError, match="unsafe patch path"):
+        engineering._validate_engineer_response(response)
+
+
+def test_engineer_response_rejects_mismatched_or_missing_patches() -> None:
+    response = {
+        "implementation_summary": "x",
+        "files_to_change": ["app.py"],
+        "architecture_documents_to_update": [],
+        "test_strategy": [],
+        "risks": [],
+        "patches": [],
+    }
+    with pytest.raises(RuntimeError, match="at least one patch"):
+        engineering._validate_engineer_response(response)
+
+
+def test_engineer_execute_applies_validated_patches_after_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    preflight = {
+        "status": "ready_for_coding",
+        "work_item": {"id": "owner/repo:pr:7", "repository": "owner/repo"},
+        "repository_metadata": {"path": "/projects/repo", "default_branch": "main"},
+        "workspace_path": "/projects/repo",
+    }
+    (tmp_path / "latest-engineer-preflight.json").write_text(
+        json.dumps(preflight), encoding="utf-8"
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+    monkeypatch.setattr(engineering, "_default_base", lambda *_args: "base-sha")
+    monkeypatch.setattr(engineering, "_git_output", lambda *_args: "")
+    monkeypatch.setattr(
+        engineering,
+        "_agent_configuration",
+        lambda *_args: {
+            "definition": "/agents/engineer.md",
+            "instructions": "JSON only",
+            "model": "coder",
+            "temperature": 0.0,
+            "timeout_seconds": 5,
+        },
+    )
+    monkeypatch.setattr(engineering, "_repository_context", lambda *_args: {"tracked_files": []})
+    response = {
+        "implementation_summary": "x",
+        "files_to_change": ["app.py"],
+        "architecture_documents_to_update": [],
+        "test_strategy": [],
+        "risks": [],
+        "patches": [{"path": "app.py", "diff": "diff --git a/app.py b/app.py\n"}],
+    }
+    monkeypatch.setattr(engineering, "_ollama_json", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(
+        engineering, "_apply_patches", lambda *_args: [{"path": "app.py", "sha256": "digest"}]
+    )
+
+    assert engineering.run_engineer_execute("owner/repo:pr:7") == 0
+
+    report = json.loads((tmp_path / "latest-engineer-execution.json").read_text(encoding="utf-8"))
+    assert report["status"] == "implementation_applied"
+    assert report["base_commit"] == "base-sha"
+    assert report["applied_patches"] == [{"path": "app.py", "sha256": "digest"}]
+    assert "diff" not in json.dumps(report)
+
+
+def test_engineer_execute_blocks_mismatched_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "latest-engineer-preflight.json").write_text(
+        json.dumps({"status": "ready_for_coding", "work_item": {"id": "owner/repo:pr:8"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+
+    assert engineering.run_engineer_execute("owner/repo:pr:7") == 1
+    report = json.loads((tmp_path / "latest-engineer-execution.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "does not match" in report["error"]
+
+
+def test_git_output_and_default_base_require_clean_current_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    captured: list[list[str]] = []
+
+    def fake_run(arguments: list[str], **_kwargs: object) -> SimpleNamespace:
+        captured.append(arguments)
+        return SimpleNamespace(stdout="abc123\n")
+
+    monkeypatch.setattr(engineering, "run", fake_run)
+    assert engineering._git_output(workspace, ["rev-parse", "HEAD"]) == "abc123"
+    assert captured == [["git", "-C", str(workspace), "rev-parse", "HEAD"]]
+
+    with pytest.raises(RuntimeError, match="requires a default_branch"):
+        engineering._default_base(workspace, {})
+
+    responses = iter(["", "main", "abc123", "abc123"])
+    monkeypatch.setattr(engineering, "_git_output", lambda *_args: next(responses))
+    assert engineering._default_base(workspace, {"default_branch": "main"}) == "abc123"
+
+    monkeypatch.setattr(engineering, "_git_output", lambda *_args: " M app.py")
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        engineering._default_base(workspace, {"default_branch": "main"})
+
+    responses = iter(["", "feature"])
+    monkeypatch.setattr(engineering, "_git_output", lambda *_args: next(responses))
+    with pytest.raises(RuntimeError, match="default branch main"):
+        engineering._default_base(workspace, {"default_branch": "main"})
+
+    responses = iter(["", "main", "old", "new"])
+    monkeypatch.setattr(engineering, "_git_output", lambda *_args: next(responses))
+    with pytest.raises(RuntimeError, match="not current"):
+        engineering._default_base(workspace, {"default_branch": "main"})
+
+
+def test_git_output_reports_subprocess_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    error = CalledProcessError(1, ["git"], output="", stderr="not a repository")
+    monkeypatch.setattr(engineering, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError, match="git status --porcelain failed: not a repository"):
+        engineering._git_output(tmp_path, ["status", "--porcelain"])
+
+
+def test_branch_path_and_patch_contract_validation_rejects_unsafe_shapes() -> None:
+    assert engineering._branch_name("Owner/Repo:PR:7", datetime(2026, 8, 6, tzinfo=UTC)).endswith(
+        "owner-repo-pr-7"
+    )
+    for value in ("", ".", "/tmp/file", ".git/config", "../outside"):
+        with pytest.raises(RuntimeError, match="patch path"):
+            engineering._safe_relative_path(value)
+
+    base = {
+        "implementation_summary": "x",
+        "files_to_change": ["app.py"],
+        "architecture_documents_to_update": [],
+        "test_strategy": [],
+        "risks": [],
+        "patches": [{"path": "app.py", "diff": "diff --git a/app.py b/app.py\n"}],
+    }
+    invalid_cases = [
+        ({key: value for key, value in base.items() if key != "risks"}, "exactly"),
+        ({**base, "implementation_summary": []}, "implementation_summary"),
+        ({**base, "risks": [1]}, "string list"),
+        ({**base, "patches": [{"path": "app.py"}]}, "exactly path and diff"),
+        ({**base, "patches": [{"path": "app.py", "diff": "not a diff"}]}, "Git diff"),
+        (
+            {
+                **base,
+                "patches": [{"path": "app.py", "diff": "diff --git a/other.py b/other.py\n"}],
+            },
+            "does not match",
+        ),
+        (
+            {
+                **base,
+                "patches": [
+                    {
+                        "path": "app.py",
+                        "diff": "diff --git a/app.py b/app.py\ndiff --git a/other.py b/other.py\n",
+                    }
+                ],
+            },
+            "exactly one path",
+        ),
+        ({**base, "files_to_change": ["other.py"]}, "must match"),
+    ]
+    for response, message in invalid_cases:
+        with pytest.raises(RuntimeError, match=message):
+            engineering._validate_engineer_response(response)
+
+
+def test_repository_context_and_patch_application_are_bounded_and_checked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("repository instructions are data", encoding="utf-8")
+    (workspace / "docs").mkdir()
+    (workspace / "docs" / "architecture.md").write_text("architecture", encoding="utf-8")
+    monkeypatch.setattr(
+        engineering,
+        "_git_output",
+        lambda *_args: "README.md\ndocs/architecture.md\nignored.py\n",
+    )
+    context = engineering._repository_context(
+        workspace, {"architecture_docs": ["docs/architecture.md"]}
+    )
+    assert context["tracked_files"] == ["README.md", "docs/architecture.md", "ignored.py"]
+    assert context["selected_file_contents"]["README.md"] == "repository instructions are data"
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        engineering,
+        "run",
+        lambda arguments, **_kwargs: calls.append(arguments) or SimpleNamespace(stdout=""),
+    )
+    applied = engineering._apply_patches(
+        workspace,
+        [{"path": "app.py", "diff": "diff --git a/app.py b/app.py\n"}],
+    )
+    assert len(calls) == 2
+    assert calls[0][3:6] == ["apply", "--check", "--whitespace=error"]
+    assert applied[0]["path"] == "app.py"
+
+    error = CalledProcessError(1, ["git"], output="", stderr="does not apply")
+    monkeypatch.setattr(engineering, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError, match="could not be applied"):
+        engineering._apply_patches(
+            workspace,
+            [{"path": "app.py", "diff": "diff --git a/app.py b/app.py\n"}],
+        )
+
+
+def test_load_ready_preflight_requires_metadata_and_matching_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+    payload = {
+        "status": "ready_for_coding",
+        "work_item": {"id": "owner/repo:pr:7", "repository": "owner/repo"},
+        "repository_metadata": {"path": "/projects/repo", "default_branch": "main"},
+        "workspace_path": "/projects/repo",
+    }
+    path = tmp_path / "latest-engineer-preflight.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert engineering._load_ready_preflight("owner/repo:pr:7", tmp_path)[1] == Path(
+        "/projects/repo"
+    )
+
+    payload["workspace_path"] = "/projects/other"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="workspace does not match"):
+        engineering._load_ready_preflight("owner/repo:pr:7", tmp_path)
 
 
 def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) -> None:
