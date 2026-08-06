@@ -17,6 +17,10 @@ import yaml
 from repo_agent.planning import _agent_configuration, _ollama_json
 
 
+_ELIGIBLE_DISPOSITIONS = frozenset({"approve", "approved", "remediate"})
+_TERMINAL_ACTIVE_STATUSES = frozenset({"blocked", "cancelled", "completed", "failed"})
+
+
 def _repository_info_path() -> Path:
     return Path(os.environ.get("AGENT_REPOSITORY_INFO", "/config/repo-info.yml"))
 
@@ -87,6 +91,169 @@ def _approved_item(item_id: str, plan: dict[str, Any]) -> tuple[dict[str, Any], 
     if source is None or decision is None:
         raise RuntimeError(f"work item is not present in the latest approved plan: {item_id}")
     return source, decision
+
+
+def _selected_approved_item(plan: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Return the first explicitly eligible architect item in plan order."""
+    architect_plan = plan.get("architect_plan")
+    if not isinstance(architect_plan, dict) or not isinstance(architect_plan.get("items"), list):
+        raise RuntimeError("latest architect plan does not contain architect items")
+    for decision in architect_plan["items"]:
+        if not isinstance(decision, dict):
+            continue
+        item_id = decision.get("id")
+        disposition = decision.get("disposition")
+        if not isinstance(item_id, str) or not isinstance(disposition, str):
+            continue
+        if disposition.strip().lower() not in _ELIGIBLE_DISPOSITIONS:
+            continue
+        return _approved_item(item_id, plan)
+    return None
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Replace a state artifact only after its complete JSON contents are durable."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}-", delete=False
+    ) as temporary:
+        temporary.write(rendered)
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(path)
+
+
+def _active_work_item(state_dir: Path) -> dict[str, Any] | None:
+    """Load an active item, retaining the serial-work safety boundary on invalid state."""
+    path = state_dir / "active-work-item.json"
+    if not path.exists():
+        return None
+    try:
+        active = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"active work item is invalid: {path}: {exc}") from exc
+    if not isinstance(active, dict) or not isinstance(active.get("status"), str):
+        raise RuntimeError(f"active work item is invalid: {path}")
+    return active
+
+
+def _dispatch_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Team lead dispatch",
+        "",
+        f"- Status: **{report['status']}**",
+        "- Scope: one approved item only; no repository, branch, pull request, or alert changed.",
+    ]
+    if report.get("error"):
+        lines.extend(["", "## Blocker", "", str(report["error"])])
+    elif report["status"] == "no_eligible_work":
+        lines.extend(["", "No architect-plan item has an explicit eligible disposition."])
+    else:
+        lines.extend(
+            [
+                "",
+                "## Active item",
+                "",
+                f"- ID: `{report.get('item_id', 'unknown')}`",
+                f"- Stage: `{report.get('stage', 'unknown')}`",
+            ]
+        )
+        if report.get("engineer_handoff_path"):
+            lines.append(f"- Engineer handoff: `{report['engineer_handoff_path']}`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_team_lead_dispatch() -> int:
+    """Assign exactly one approved plan item to the read-only engineer handoff."""
+    timestamp = datetime.now(UTC)
+    state_dir = Path(os.environ["AGENT_STATE_DIR"])
+    plan_path = state_dir / "latest-architect-plan.json"
+    active_path = state_dir / "active-work-item.json"
+    report: dict[str, Any] = {
+        "kind": "team_lead_dispatch",
+        "started_at": timestamp.isoformat(),
+        "mode": "read_only_handoff_only",
+        "plan_path": str(plan_path),
+        "status": "blocked",
+    }
+    try:
+        active = _active_work_item(state_dir)
+        if active is not None and active["status"] not in _TERMINAL_ACTIVE_STATUSES:
+            report.update(
+                {
+                    "status": "already_assigned",
+                    "item_id": active.get("item_id"),
+                    "stage": active.get("stage"),
+                    "active_work_item_path": str(active_path),
+                }
+            )
+        else:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            if not isinstance(plan, dict):
+                raise RuntimeError("latest architect plan must be a JSON object")
+            if plan.get("status") != "approved":
+                raise RuntimeError("latest architect plan must have status approved")
+            critic = plan.get("critic")
+            if not isinstance(critic, dict) or critic.get("verdict") != "approved":
+                raise RuntimeError("latest architect plan requires an approved critic verdict")
+            selected = _selected_approved_item(plan)
+            if selected is None:
+                report["status"] = "no_eligible_work"
+            else:
+                work_item, decision = selected
+                item_id = work_item.get("id")
+                assert isinstance(item_id, str)
+                if run_engineer_handoff(item_id) != 0:
+                    raise RuntimeError("engineer handoff did not become ready_for_implementation")
+                handoff_path = state_dir / "latest-engineer-handoff.json"
+                handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
+                if not isinstance(handoff, dict) or handoff.get("status") != "ready_for_implementation":
+                    raise RuntimeError("engineer handoff did not become ready_for_implementation")
+                active = {
+                    "kind": "active_work_item",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "plan_path": str(plan_path),
+                    "plan_report_path": plan.get("report_path"),
+                    "item_id": item_id,
+                    "work_item": work_item,
+                    "architect_decision": decision,
+                    "stage": "engineer_handoff",
+                    "status": "assigned",
+                    "engineer_handoff_path": str(handoff_path),
+                    "engineer_handoff_report_path": handoff.get("report_path"),
+                }
+                _write_json_atomic(active_path, active)
+                report.update(active)
+                report["status"] = "assigned"
+                report["active_work_item_path"] = str(active_path)
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        report["error"] = str(exc)
+
+    report["completed_at"] = datetime.now(UTC).isoformat()
+    run_dir = state_dir / "runs" / timestamp.strftime("%Y%m%dT%H%M%SZ")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report_path = run_dir / "team-lead-dispatch.json"
+    markdown_path = run_dir / "team-lead-dispatch.md"
+    report["report_path"] = str(report_path)
+    report["markdown_path"] = str(markdown_path)
+    rendered = _dispatch_markdown(report)
+    report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    markdown_path.write_text(rendered, encoding="utf-8")
+    (state_dir / "latest-team-lead-dispatch.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (state_dir / "latest-team-lead-dispatch.md").write_text(rendered, encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "event": "team_lead_dispatch_completed",
+                "report": str(report_path),
+                "status": report["status"],
+            }
+        )
+    )
+    return 1 if report["status"] == "blocked" else 0
 
 
 def _markdown_report(report: dict[str, Any]) -> str:
