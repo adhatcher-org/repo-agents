@@ -1396,3 +1396,63 @@ def test_main_exits_with_selected_workflow_result(
         cli.main()
 
     assert result.value.code == 0
+
+
+@pytest.mark.parametrize(
+    ("command", "attribute"),
+    [
+        ("plan-once", "run_planning"),
+        ("dispatch-once", "run_team_lead_dispatch"),
+        ("daemon", "daemon"),
+    ],
+)
+def test_main_routes_itemless_commands_to_their_stage(
+    monkeypatch: pytest.MonkeyPatch, command: str, attribute: str
+) -> None:
+    """Every stage that takes no work item must reach exactly its own entry point."""
+    called: list[str] = []
+    monkeypatch.setattr("sys.argv", ["repo-agent", command])
+    monkeypatch.setattr(cli, attribute, lambda: called.append(attribute) or 3)
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert called == [attribute]
+    assert result.value.code == 3
+
+
+@pytest.mark.parametrize(
+    ("command", "attribute"),
+    [
+        ("engineer-handoff", "run_engineer_handoff"),
+        ("engineer-preflight", "run_engineer_preflight"),
+        ("engineer-execute", "run_engineer_execute"),
+    ],
+)
+def test_main_forwards_the_exact_item_to_engineer_stages(
+    monkeypatch: pytest.MonkeyPatch, command: str, attribute: str
+) -> None:
+    """The engineer stages must receive the requested item ID unmodified."""
+    received: list[str] = []
+    monkeypatch.setattr("sys.argv", ["repo-agent", command, "--item", "alert-42"])
+    monkeypatch.setattr(cli, attribute, lambda item: received.append(item) or 0)
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert received == ["alert-42"]
+    assert result.value.code == 0
+
+
+@pytest.mark.parametrize("command", ["engineer-handoff", "engineer-preflight", "engineer-execute"])
+def test_main_refuses_an_engineer_stage_without_an_item(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    """An engineer stage may never run against an unspecified work item."""
+    monkeypatch.setattr("sys.argv", ["repo-agent", command])
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert result.value.code == 2
+    assert "requires --item" in capsys.readouterr().err
