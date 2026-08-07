@@ -15,9 +15,10 @@ docker exec repo-agent repo-agent agents
 ```
 
 `team_lead`, `senior_architect`, and `senior_architect_critic` are active in the read-only
-inventory/planning milestone. The software engineer can now prepare one selected, approved item
-for a later execution stage. The test, PR-review, and CI-monitor roles remain deliberately planned
-until their isolated write and verification boundaries are implemented.
+inventory/planning milestone. The software engineer can now prepare and execute one selected,
+approved item, and `test_agent` is an active deterministic executor that verifies the result. The
+PR-review and CI-monitor roles remain deliberately planned until their isolated write and
+verification boundaries are implemented.
 
 ## Architect and critic planning stage
 
@@ -125,9 +126,37 @@ docker compose --profile engineer run --rm --no-deps \
 The execution report is written to `latest-engineer-execution.json`. It records the base commit, branch,
 agent model/definition, changed paths, and SHA-256 digests of accepted patches—but never the token or patch
 contents. Execution deliberately does not run tests, commit, push, create a pull request, merge, or dismiss
-alerts. A later test-agent stage must validate the dirty feature branch before any publishing action.
+alerts. The test stage below validates the dirty feature branch before any publishing action.
 
 The daily `repo-agent` controller remains running without access to `se-gh-token`.
+
+## Test execution
+
+`test-execute` is deterministic: it never calls Ollama. It reads `latest-engineer-execution.json`,
+re-reads the repository's `quality_gates` from `repo-info.yml`, and runs them inside a disposable Git
+worktree at `<ENGINEER_REPOSITORY_ROOT>/.repo-agent-worktrees/<repository>/<run-id>`.
+
+```bash
+docker compose --profile engineer run --rm --no-deps \
+  --entrypoint repo-agent repo-agent-engineer \
+  test-execute --item 'OWNER/REPOSITORY:pr:NUMBER'
+```
+
+For an `existing_pull_request_ready_for_testing` execution it fetches that pull request's own head
+commit; for an `implementation_applied` execution it reproduces the engineer branch together with the
+patch set that stage deliberately left uncommitted. Any other upstream status is a blocker.
+
+Only configured gates run, in the order `bootstrap`, `format`, `lint`, `test`, `coverage`,
+`security`. Each gate's command, exit code, and truncated output are recorded; a gate that is not
+configured is reported as `skipped` and never as a pass. The `coverage` gate's parsed percentage is
+compared against `minimum_coverage`, and an unmet or unreadable percentage fails it. Gate commands
+come from operator configuration, so they are split with `shlex` and run with no shell, a bounded
+timeout (`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and no GitHub token in their environment.
+
+Reports are written to `test-report.json`/`test-report.md` in the run directory and to
+`latest-test-report.json`/`latest-test-report.md`, with status `passed`, `failed`, or `blocked`. The
+disposable worktree is always removed. The stage never modifies the configured checkout, commits,
+pushes, creates pull requests, merges, or dismisses alerts.
 
 ## Run through Unraid Compose
 
