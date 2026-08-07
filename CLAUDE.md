@@ -134,8 +134,10 @@ PR diff reaches the later test stage instead of a regenerated patch.
 
 `test-execute` runs the configured gates in a disposable worktree under
 `<ENGINEER_REPOSITORY_ROOT>/.repo-agent-worktrees/<repository>/<run-id>` and removes it in a
-`finally`, on success and failure alike. It reads the configured checkout (to fetch a PR head or to
-export the engineer branch's still-uncommitted diff) but never changes it, and it does not commit,
+`finally`, on success and failure alike. It reads the configured checkout (to fetch a PR head, or to
+export the engineer branch's still-uncommitted `git diff --binary HEAD` *and* copy in the untracked
+files that diff cannot express) but never changes it — not the working tree, not the index — and it
+does not commit,
 push, open a PR, merge, or dismiss alerts. A gate absent from `quality_gates` is reported as
 `skipped`, never as a pass. Don't add publishing side effects to existing stages; they belong to the
 not-yet-implemented review/publish/CI roles.

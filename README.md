@@ -144,7 +144,10 @@ docker compose --profile engineer run --rm --no-deps \
 
 For an `existing_pull_request_ready_for_testing` execution it fetches that pull request's own head
 commit; for an `implementation_applied` execution it reproduces the engineer branch together with the
-patch set that stage deliberately left uncommitted. Any other upstream status is a blocker.
+patch set that stage deliberately left uncommitted. Because `git diff HEAD` describes tracked files
+only, new files the engineer created are copied into the worktree separately, respecting
+`.gitignore`; symlinks are listed rather than followed. The report's `checkout` block names every
+file transferred either way. Any other upstream status is a blocker.
 
 Only configured gates run, in the order `bootstrap`, `format`, `lint`, `test`, `coverage`,
 `security`. Each gate's command, exit code, and truncated output are recorded; a gate that is not

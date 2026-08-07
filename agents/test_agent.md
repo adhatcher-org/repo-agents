@@ -24,7 +24,9 @@ two upstream shapes:
 
 - `existing_pull_request_ready_for_testing` — fetches that pull request's own head commit.
 - `implementation_applied` — reproduces the engineer branch, including the patch set that stage
-  deliberately leaves uncommitted.
+  deliberately leaves uncommitted. `git diff HEAD` covers only tracked files, so new files the
+  engineer created are copied in separately, honouring `.gitignore`. Symlinks are not copied.
+  Both transfers are recorded in the report's `checkout` block as evidence.
 
 Every run happens in a disposable Git worktree under
 `<ENGINEER_REPOSITORY_ROOT>/.repo-agent-worktrees/<repository>/<run-id>`, which is removed on

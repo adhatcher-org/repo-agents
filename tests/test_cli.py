@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import subprocess
@@ -1886,3 +1887,156 @@ def test_test_markdown_omits_an_empty_acceptance_criteria_section() -> None:
     )
     assert "Acceptance criteria" not in rendered
     assert "`test`: **passed** — exit code 0" in rendered
+
+
+def _engineer_working_changes(workspace: Path) -> None:
+    """Reproduce what engineer-execute leaves behind: edits, a deletion, and brand new files."""
+    (workspace / ".gitignore").write_text("*.log\nignored-dir/\n", encoding="utf-8")
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add ignore rules")
+    (workspace / "marker.txt").write_text("engineer-uncommitted\n", encoding="utf-8")
+    (workspace / "coverage.txt").unlink()
+    (workspace / "newpkg" / "sub").mkdir(parents=True)
+    (workspace / "newpkg" / "sub" / "mod.py").write_text("new module\n", encoding="utf-8")
+    (workspace / "newpkg" / "data.bin").write_bytes(bytes(range(256)))
+    (workspace / "debug.log").write_text("noise\n", encoding="utf-8")
+    (workspace / "ignored-dir").mkdir()
+    (workspace / "ignored-dir" / "junk.txt").write_text("noise\n", encoding="utf-8")
+    (workspace / "danglink").symlink_to("/etc/hosts")
+
+
+def _checkout_fingerprint(workspace: Path) -> dict[str, object]:
+    """Capture everything the test stage promises not to disturb, excluding Git's own metadata."""
+    contents: dict[str, str] = {}
+    for path in sorted(workspace.rglob("*")):
+        relative = path.relative_to(workspace)
+        if ".git" in relative.parts:
+            continue
+        if path.is_symlink():
+            contents[str(relative)] = f"symlink:{path.readlink()}"
+        elif path.is_file():
+            contents[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            contents[str(relative)] = "directory"
+    return {
+        "contents": contents,
+        "status": _git_command(workspace, "status", "--porcelain", "--untracked-files=all"),
+        "index": _git_command(workspace, "ls-files", "--stage"),
+        "head": _git_command(workspace, "rev-parse", "HEAD"),
+        "branch": _git_command(workspace, "branch", "--show-current"),
+    }
+
+
+def test_test_execute_copies_new_untracked_files_into_the_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git diff HEAD` omits untracked files, so a new module must be copied in explicitly."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat newpkg/sub/mod.py", "lint": "cat marker.txt"},
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-3")
+    _engineer_working_changes(workspace)
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:4",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-3",
+        },
+    )
+    real_run_gates = testing._run_gates
+    observed: dict[str, object] = {}
+
+    def spy(gates: dict[str, object], worktree: Path) -> list[dict[str, object]]:
+        observed["files"] = sorted(
+            str(path.relative_to(worktree))
+            for path in worktree.rglob("*")
+            if path.is_file() and path.name != ".git"
+        )
+        blob = worktree / "newpkg" / "data.bin"
+        observed["binary"] = blob.read_bytes() if blob.is_file() else None
+        return real_run_gates(gates, worktree)
+
+    monkeypatch.setattr(testing, "_run_gates", spy)
+
+    assert testing.run_test_execute("owner/repo:alert:4") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "new module\n"
+    assert gates["lint"]["stdout"] == "engineer-uncommitted\n"
+
+    checkout = report["checkout"]
+    assert checkout["untracked_files_copied"] == ["newpkg/data.bin", "newpkg/sub/mod.py"]
+    assert checkout["untracked_paths_skipped"] == ["danglink"]
+    assert observed["binary"] == bytes(range(256))
+    # The deleted file is gone, ignored paths never arrive, and the symlink is not followed.
+    assert observed["files"] == [
+        ".gitignore",
+        "marker.txt",
+        "newpkg/data.bin",
+        "newpkg/sub/mod.py",
+    ]
+    markdown = (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+    assert "New files tested: `newpkg/data.bin`, `newpkg/sub/mod.py`" in markdown
+    assert "Untracked paths not copied: `danglink`" in markdown
+
+
+def test_test_execute_leaves_the_configured_checkout_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Copying untracked files may not stage, stash, or otherwise disturb the real checkout."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-4")
+    _engineer_working_changes(workspace)
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:5",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-4",
+        },
+    )
+    before = _checkout_fingerprint(workspace)
+
+    assert testing.run_test_execute("owner/repo:alert:5") == 0
+
+    assert _checkout_fingerprint(workspace) == before
+    assert "?? newpkg/" in str(before["status"])
+
+
+def test_worktree_destination_refuses_paths_that_escape_the_worktree(tmp_path: Path) -> None:
+    """A path from `ls-files` is still untrusted input to a filesystem write."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    assert testing._worktree_destination(worktree, "pkg/mod.py") == worktree / "pkg" / "mod.py"
+    for unsafe in ("/etc/passwd", "../escape.txt", "pkg/../../escape.txt", ".git/config"):
+        with pytest.raises(RuntimeError, match="unsafe to copy"):
+            testing._worktree_destination(worktree, unsafe)
+
+    (worktree / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    with pytest.raises(RuntimeError, match="resolves outside the worktree"):
+        testing._worktree_destination(worktree, "link/file.txt")
+
+
+def test_copy_untracked_skips_directories_and_reports_nothing_to_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty listing must not be mistaken for a failure, and non-files are never copied."""
+    monkeypatch.setattr(testing, "_git_output", lambda *_args: "")
+    assert testing._copy_untracked(tmp_path, tmp_path) == ([], [])
+
+    workspace = tmp_path / "workspace"
+    (workspace / "empty-dir").mkdir(parents=True)
+    monkeypatch.setattr(testing, "_git_output", lambda *_args: "empty-dir\0missing.txt\0")
+    assert testing._copy_untracked(workspace, tmp_path / "worktree") == (
+        [],
+        ["empty-dir", "missing.txt"],
+    )

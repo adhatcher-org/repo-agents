@@ -104,6 +104,37 @@ def _apply_pending(worktree: Path, diff: str) -> None:
         _git_output(worktree, ["apply", "--whitespace=nowarn", patch_file.name])
 
 
+def _worktree_destination(worktree: Path, relative: str) -> Path:
+    """Keep every copied path inside the disposable worktree, symlinked parents included."""
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts or ".git" in path.parts:
+        raise RuntimeError(f"untracked path is unsafe to copy: {relative}")
+    destination = worktree / path
+    if not destination.resolve().is_relative_to(worktree.resolve()):
+        raise RuntimeError(f"untracked path resolves outside the worktree: {relative}")
+    return destination
+
+
+def _copy_untracked(workspace: Path, worktree: Path) -> tuple[list[str], list[str]]:
+    """Carry new files into the worktree; `git diff HEAD` reports only tracked paths."""
+    listed = _git_output(workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    copied: list[str] = []
+    skipped: list[str] = []
+    for entry in listed.split("\0"):
+        if not entry:
+            continue
+        source = workspace / entry
+        # Symlinks are not copied: their target is resolved by the reader, not by this stage.
+        if source.is_symlink() or not source.is_file():
+            skipped.append(entry)
+            continue
+        destination = _worktree_destination(worktree, entry)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        copied.append(entry)
+    return copied, skipped
+
+
 def _checkout_branch(workspace: Path, worktree: Path, branch: object) -> dict[str, Any]:
     """Test the engineer branch including the patch set that stage deliberately left uncommitted."""
     if not isinstance(branch, str) or not branch:
@@ -116,14 +147,17 @@ def _checkout_branch(workspace: Path, worktree: Path, branch: object) -> dict[st
         )
     head = _git_output(workspace, ["rev-parse", "HEAD"])
     _git_output(workspace, ["worktree", "add", "--detach", str(worktree), head])
-    pending = _git_output(workspace, ["diff", "HEAD"])
+    pending = _git_output(workspace, ["diff", "--binary", "HEAD"])
     if pending:
         _apply_pending(worktree, pending)
+    copied, skipped = _copy_untracked(workspace, worktree)
     return {
         "source": "engineer_branch",
         "branch": branch,
         "head_commit": head,
         "uncommitted_changes_applied": bool(pending),
+        "untracked_files_copied": copied,
+        "untracked_paths_skipped": skipped,
     }
 
 
@@ -249,11 +283,19 @@ def _test_markdown(report: dict[str, Any]) -> str:
             f"- Source: `{checkout.get('source', 'unknown')}`",
             f"- Head commit: `{checkout.get('head_commit', 'unknown')}`",
             f"- Worktree removed: {report.get('worktree_removed')}",
-            "",
-            "## Gates",
-            "",
         ]
     )
+    if checkout.get("untracked_files_copied"):
+        lines.append(
+            "- New files tested: "
+            + ", ".join(f"`{path}`" for path in checkout["untracked_files_copied"])
+        )
+    if checkout.get("untracked_paths_skipped"):
+        lines.append(
+            "- Untracked paths not copied: "
+            + ", ".join(f"`{path}`" for path in checkout["untracked_paths_skipped"])
+        )
+    lines.extend(["", "## Gates", ""])
     for gate in report.get("gates", []):
         detail = gate.get("error") or f"exit code {gate.get('exit_code')}"
         if gate["status"] == "skipped":
