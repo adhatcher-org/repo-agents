@@ -44,6 +44,21 @@ the inventory was not successful, a model was not configured, Ollama failed, or 
 not return the required complete JSON contract. This stage never changes repositories, documents,
 branches, pull requests, or alerts.
 
+## Team-lead dispatch
+
+After a plan and critic verdict are both `approved`, the team lead can assign exactly one item to
+the senior-engineer handoff:
+
+```bash
+docker exec repo-agent repo-agent dispatch-once
+```
+
+The dispatcher evaluates architect-plan items in their declared order and only accepts explicit
+`approve`, `approved`, or `remediate` dispositions. It records its selection in
+`data/active-work-item.json`, calls the existing read-only engineer handoff, and writes JSON and
+Markdown dispatch reports. It will not assign another item until a later workflow stage records a
+terminal active-item status. The daily inventory daemon does not dispatch work automatically.
+
 ## Senior software engineer handoff
 
 The handoff command requires an exact work-item ID from the latest **approved** architect plan. It

@@ -457,6 +457,159 @@ def test_engineer_handoff_requires_a_selected_item_from_an_approved_plan(
     assert report["architect_decision"]["acceptance_criteria"] == ["Tests pass"]
 
 
+def _dispatch_plan(*decisions: dict[str, object]) -> dict[str, object]:
+    return {
+        "status": "approved",
+        "critic": {"verdict": "approved"},
+        "report_path": "/data/runs/plan/architect-plan.json",
+        "work_items": [
+            {
+                "id": decision["id"],
+                "repository": "owner/repo",
+                "kind": "dependabot",
+                "title": str(decision["id"]),
+            }
+            for decision in decisions
+        ],
+        "architect_plan": {"items": list(decisions)},
+    }
+
+
+def _ready_handoff(tmp_path: Path, item_id: str) -> int:
+    (tmp_path / "latest-engineer-handoff.json").write_text(
+        json.dumps(
+            {
+                "status": "ready_for_implementation",
+                "report_path": "/data/runs/handoff/engineer-handoff.json",
+                "requested_item_id": item_id,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return 0
+
+
+def test_team_lead_dispatch_selects_first_explicitly_eligible_item_in_plan_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plan = _dispatch_plan(
+        {"id": "owner/repo:pr:1", "disposition": "defer"},
+        {"id": "owner/repo:pr:2", "disposition": "Remediate"},
+        {"id": "owner/repo:pr:3", "disposition": "approve"},
+    )
+    (tmp_path / "latest-architect-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    called: list[str] = []
+
+    def fake_handoff(item_id: str) -> int:
+        called.append(item_id)
+        return _ready_handoff(tmp_path, item_id)
+
+    monkeypatch.setattr(engineering, "run_engineer_handoff", fake_handoff)
+
+    assert engineering.run_team_lead_dispatch() == 0
+
+    active = json.loads((tmp_path / "active-work-item.json").read_text(encoding="utf-8"))
+    report = json.loads((tmp_path / "latest-team-lead-dispatch.json").read_text(encoding="utf-8"))
+    assert called == ["owner/repo:pr:2"]
+    assert active["item_id"] == "owner/repo:pr:2"
+    assert active["stage"] == "engineer_handoff"
+    assert active["status"] == "assigned"
+    assert report["status"] == "assigned"
+    assert (tmp_path / "latest-team-lead-dispatch.md").is_file()
+
+
+@pytest.mark.parametrize("disposition", ["Approve", "approved", "remediate"])
+def test_team_lead_dispatch_accepts_only_normalized_eligible_dispositions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, disposition: str
+) -> None:
+    item_id = "owner/repo:pr:7"
+    (tmp_path / "latest-architect-plan.json").write_text(
+        json.dumps(_dispatch_plan({"id": item_id, "disposition": disposition})), encoding="utf-8"
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        engineering, "run_engineer_handoff", lambda selected: _ready_handoff(tmp_path, selected)
+    )
+
+    assert engineering.run_team_lead_dispatch() == 0
+
+    active = json.loads((tmp_path / "active-work-item.json").read_text(encoding="utf-8"))
+    assert active["item_id"] == item_id
+
+
+def test_team_lead_dispatch_refuses_a_second_nonterminal_assignment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "active-work-item.json").write_text(
+        json.dumps({"status": "assigned", "item_id": "owner/repo:pr:1", "stage": "testing"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        engineering,
+        "run_engineer_handoff",
+        lambda _item_id: (_ for _ in ()).throw(AssertionError("handoff should not run")),
+    )
+
+    assert engineering.run_team_lead_dispatch() == 0
+
+    report = json.loads((tmp_path / "latest-team-lead-dispatch.json").read_text(encoding="utf-8"))
+    assert report["status"] == "already_assigned"
+    assert report["item_id"] == "owner/repo:pr:1"
+
+
+def test_team_lead_dispatch_reports_no_eligible_work_without_creating_active_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "latest-architect-plan.json").write_text(
+        json.dumps(_dispatch_plan({"id": "owner/repo:pr:1", "disposition": "defer"})),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        engineering,
+        "run_engineer_handoff",
+        lambda _item_id: (_ for _ in ()).throw(AssertionError("handoff should not run")),
+    )
+
+    assert engineering.run_team_lead_dispatch() == 0
+
+    report = json.loads((tmp_path / "latest-team-lead-dispatch.json").read_text(encoding="utf-8"))
+    assert report["status"] == "no_eligible_work"
+    assert not (tmp_path / "active-work-item.json").exists()
+
+
+def test_team_lead_dispatch_blocks_invalid_plan_or_unsuccessful_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    (tmp_path / "latest-architect-plan.json").write_text(
+        json.dumps({"status": "approved", "critic": {"verdict": "changes_requested"}}),
+        encoding="utf-8",
+    )
+
+    assert engineering.run_team_lead_dispatch() == 1
+
+    report = json.loads((tmp_path / "latest-team-lead-dispatch.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "critic verdict" in report["error"]
+    assert not (tmp_path / "active-work-item.json").exists()
+
+    (tmp_path / "latest-architect-plan.json").write_text(
+        json.dumps(_dispatch_plan({"id": "owner/repo:pr:1", "disposition": "approve"})),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engineering, "run_engineer_handoff", lambda _item_id: 1)
+
+    assert engineering.run_team_lead_dispatch() == 1
+
+    report = json.loads((tmp_path / "latest-team-lead-dispatch.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "did not become ready" in report["error"]
+    assert not (tmp_path / "active-work-item.json").exists()
+
+
 def test_engineer_handoff_blocks_unconfigured_repository(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1243,3 +1396,63 @@ def test_main_exits_with_selected_workflow_result(
         cli.main()
 
     assert result.value.code == 0
+
+
+@pytest.mark.parametrize(
+    ("command", "attribute"),
+    [
+        ("plan-once", "run_planning"),
+        ("dispatch-once", "run_team_lead_dispatch"),
+        ("daemon", "daemon"),
+    ],
+)
+def test_main_routes_itemless_commands_to_their_stage(
+    monkeypatch: pytest.MonkeyPatch, command: str, attribute: str
+) -> None:
+    """Every stage that takes no work item must reach exactly its own entry point."""
+    called: list[str] = []
+    monkeypatch.setattr("sys.argv", ["repo-agent", command])
+    monkeypatch.setattr(cli, attribute, lambda: called.append(attribute) or 3)
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert called == [attribute]
+    assert result.value.code == 3
+
+
+@pytest.mark.parametrize(
+    ("command", "attribute"),
+    [
+        ("engineer-handoff", "run_engineer_handoff"),
+        ("engineer-preflight", "run_engineer_preflight"),
+        ("engineer-execute", "run_engineer_execute"),
+    ],
+)
+def test_main_forwards_the_exact_item_to_engineer_stages(
+    monkeypatch: pytest.MonkeyPatch, command: str, attribute: str
+) -> None:
+    """The engineer stages must receive the requested item ID unmodified."""
+    received: list[str] = []
+    monkeypatch.setattr("sys.argv", ["repo-agent", command, "--item", "alert-42"])
+    monkeypatch.setattr(cli, attribute, lambda item: received.append(item) or 0)
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert received == ["alert-42"]
+    assert result.value.code == 0
+
+
+@pytest.mark.parametrize("command", ["engineer-handoff", "engineer-preflight", "engineer-execute"])
+def test_main_refuses_an_engineer_stage_without_an_item(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
+) -> None:
+    """An engineer stage may never run against an unspecified work item."""
+    monkeypatch.setattr("sys.argv", ["repo-agent", command])
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert result.value.code == 2
+    assert "requires --item" in capsys.readouterr().err

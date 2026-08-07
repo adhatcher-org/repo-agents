@@ -20,6 +20,7 @@ from repo_agent.engineering import (
     run_engineer_execute,
     run_engineer_handoff,
     run_engineer_preflight,
+    run_team_lead_dispatch,
 )
 from repo_agent.planning import run_planning
 
@@ -406,6 +407,7 @@ def main() -> None:
         choices=(
             "agents",
             "daemon",
+            "dispatch-once",
             "engineer-handoff",
             "engineer-preflight",
             "engineer-execute",
@@ -428,6 +430,8 @@ def main() -> None:
         sys.exit(run_inventory())
     if args.command == "plan-once":
         sys.exit(run_planning())
+    if args.command == "dispatch-once":
+        sys.exit(run_team_lead_dispatch())
     if args.command == "engineer-handoff":
         if not args.item:
             parser.error("engineer-handoff requires --item <approved-work-item-id>")
