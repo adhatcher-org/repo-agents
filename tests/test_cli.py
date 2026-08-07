@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from subprocess import CalledProcessError
+from subprocess import CalledProcessError, TimeoutExpired
 from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.request import Request
 
 import pytest
 
-from repo_agent import cli, engineering, planning
+from repo_agent import cli, engineering, planning, testing
 
 
 class _Response:
@@ -1427,6 +1428,7 @@ def test_main_routes_itemless_commands_to_their_stage(
         ("engineer-handoff", "run_engineer_handoff"),
         ("engineer-preflight", "run_engineer_preflight"),
         ("engineer-execute", "run_engineer_execute"),
+        ("test-execute", "run_test_execute"),
     ],
 )
 def test_main_forwards_the_exact_item_to_engineer_stages(
@@ -1444,7 +1446,9 @@ def test_main_forwards_the_exact_item_to_engineer_stages(
     assert result.value.code == 0
 
 
-@pytest.mark.parametrize("command", ["engineer-handoff", "engineer-preflight", "engineer-execute"])
+@pytest.mark.parametrize(
+    "command", ["engineer-handoff", "engineer-preflight", "engineer-execute", "test-execute"]
+)
 def test_main_refuses_an_engineer_stage_without_an_item(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
 ) -> None:
@@ -1456,3 +1460,429 @@ def test_main_refuses_an_engineer_stage_without_an_item(
 
     assert result.value.code == 2
     assert "requires --item" in capsys.readouterr().err
+
+
+def _git_command(path: Path, *arguments: str) -> str:
+    """Drive the fixture repository directly, outside the code under test."""
+    completed = subprocess.run(
+        ["git", "-C", str(path), *arguments], check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+def _testing_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gates: dict[str, object]
+) -> tuple[Path, Path]:
+    """Build a real checkout, bare origin, repository metadata, and state directory."""
+    projects = tmp_path / "projects"
+    workspace = projects / "repo"
+    workspace.mkdir(parents=True)
+    _git_command(workspace, "init", "-b", "main")
+    _git_command(workspace, "config", "user.email", "agent@example.test")
+    _git_command(workspace, "config", "user.name", "Repo Agent")
+    (workspace / "marker.txt").write_text("main-head\n", encoding="utf-8")
+    (workspace / "coverage.txt").write_text("Total coverage: 95.00%\n", encoding="utf-8")
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "seed")
+    _git_command(workspace, "clone", "--bare", str(workspace), str(tmp_path / "origin.git"))
+    _git_command(workspace, "remote", "add", "origin", str(tmp_path / "origin.git"))
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    info_path = tmp_path / "repo-info.yml"
+    info_path.write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "slug": "owner/repo",
+                        "path": str(workspace),
+                        "default_branch": "main",
+                        "quality_gates": gates,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(info_path))
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", str(projects))
+    return workspace, state_dir
+
+
+def _write_execution(state_dir: Path, execution: dict[str, object]) -> None:
+    (state_dir / "latest-engineer-execution.json").write_text(
+        json.dumps(execution), encoding="utf-8"
+    )
+
+
+def test_test_execute_runs_configured_gates_against_an_existing_pull_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An existing PR is verified at its own head, with unconfigured gates recorded as skipped."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat marker.txt", "coverage": "cat coverage.txt", "minimum_coverage": 90},
+    )
+    _git_command(workspace, "switch", "-c", "pull-source")
+    (workspace / "marker.txt").write_text("pull-request-head\n", encoding="utf-8")
+    _git_command(workspace, "commit", "-am", "pull request change")
+    _git_command(workspace, "push", str(tmp_path / "origin.git"), "HEAD:refs/pull/7/head")
+    _git_command(workspace, "switch", "main")
+    _git_command(workspace, "branch", "-D", "pull-source")
+    _write_execution(
+        state_dir,
+        {
+            "status": "existing_pull_request_ready_for_testing",
+            "requested_item_id": "owner/repo:pr:7",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "work_item": {"id": "owner/repo:pr:7", "kind": "open_pull_request"},
+            "architect_decision": {"acceptance_criteria": ["Every configured gate passes"]},
+            "pull_request_url": "https://github.com/owner/repo/pull/7",
+        },
+    )
+
+    assert testing.run_test_execute("owner/repo:pr:7") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert report["checkout"]["source"] == "existing_pull_request"
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "pull-request-head\n"
+    assert gates["coverage"]["coverage_percent"] == 95.0
+    assert gates["coverage"]["minimum_coverage"] == 90
+    assert [name for name, gate in gates.items() if gate["status"] == "skipped"] == [
+        "bootstrap",
+        "format",
+        "lint",
+        "security",
+    ]
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+    assert _git_command(workspace, "status", "--porcelain") == ""
+    assert _git_command(workspace, "branch", "--show-current") == "main"
+    markdown = (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+    assert "Every configured gate passes" in markdown
+    assert "`security`: **skipped**" in markdown
+    assert json.loads(capsys.readouterr().out)["status"] == "passed"
+
+
+def test_test_execute_runs_the_engineer_branch_with_its_uncommitted_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remediation branch is verified as the engineer left it, and one failing gate fails."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat marker.txt", "lint": "git rev-parse --verify missing-ref"},
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-1")
+    (workspace / "marker.txt").write_text("branch-head\n", encoding="utf-8")
+    _git_command(workspace, "commit", "-am", "branch change")
+    (workspace / "marker.txt").write_text("engineer-uncommitted\n", encoding="utf-8")
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:1",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-1",
+        },
+    )
+    (state_dir / "latest-engineer-preflight.json").write_text(
+        json.dumps(
+            {
+                "work_item": {"id": "owner/repo:alert:1", "repository": "owner/repo"},
+                "architect_decision": {"acceptance_criteria": ["Patch the vulnerable dependency"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert testing.run_test_execute("owner/repo:alert:1") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checkout"]["uncommitted_changes_applied"] is True
+    assert report["work_item"]["id"] == "owner/repo:alert:1"
+    assert report["architect_decision"]["acceptance_criteria"] == [
+        "Patch the vulnerable dependency"
+    ]
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "engineer-uncommitted\n"
+    assert gates["lint"]["status"] == "failed"
+    assert gates["lint"]["exit_code"] != 0
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+
+
+def test_test_execute_removes_the_worktree_when_a_gate_run_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The disposable worktree is created, then discarded even when the stage blocks."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-2")
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:2",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-2",
+        },
+    )
+    observed: list[bool] = []
+
+    def explode(_gates: dict[str, object], worktree: Path) -> list[dict[str, object]]:
+        observed.append((worktree / "marker.txt").is_file())
+        raise RuntimeError("gate runner exploded")
+
+    monkeypatch.setattr(testing, "_run_gates", explode)
+
+    assert testing.run_test_execute("owner/repo:alert:2") == 1
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert observed == [True]
+    assert report["status"] == "blocked"
+    assert report["error"] == "gate runner exploded"
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+    assert "## Blocker" in (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("execution", "message"),
+    [
+        ({"requested_item_id": "other", "status": "implementation_applied"}, "does not match"),
+        ({"requested_item_id": "item", "status": "blocked"}, "not ready for testing"),
+        ({"requested_item_id": "item", "status": "implementation_applied"}, "does not name a repo"),
+        ("not an object", "must be a JSON object"),
+    ],
+)
+def test_test_execute_blocks_an_unusable_upstream_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, execution: object, message: str
+) -> None:
+    """Only a matching, testable engineer execution may reach a repository checkout."""
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    _write_execution(tmp_path, execution)  # type: ignore[arg-type]
+
+    assert testing.run_test_execute("item") == 1
+
+    report = json.loads((tmp_path / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert message in report["error"]
+
+
+@pytest.mark.parametrize(
+    ("gates", "message"),
+    [
+        ({"minimum_coverage": 90}, "configures no quality gates"),
+        (None, "configures no quality gates"),
+    ],
+)
+def test_test_execute_blocks_without_configured_gates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gates: object, message: str
+) -> None:
+    """An unconfigured repository must block rather than report an empty pass."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, gates)  # type: ignore[arg-type]
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:3",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "missing",
+        },
+    )
+
+    assert testing.run_test_execute("owner/repo:alert:3") == 1
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert message in report["error"]
+
+
+def test_test_execute_blocks_unknown_repositories_and_mismatched_workspaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repository metadata, not the upstream artifact, decides which checkout is tested."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    execution = {
+        "status": "implementation_applied",
+        "requested_item_id": "item",
+        "repository": "owner/other",
+        "workspace_path": str(workspace),
+        "branch": "main",
+    }
+    _write_execution(state_dir, execution)
+    assert testing.run_test_execute("item") == 1
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert "not configured for execution" in report["error"]
+
+    execution.update({"repository": "owner/repo", "workspace_path": "/projects/elsewhere"})
+    _write_execution(state_dir, execution)
+    assert testing.run_test_execute("item") == 1
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert "workspace does not match" in report["error"]
+
+
+def test_checkout_rejects_unusable_pull_request_urls_and_branches(tmp_path: Path) -> None:
+    """Neither Git refspecs nor branch names may be assembled from unvalidated artifact fields."""
+    for url in (None, "https://github.com/owner/repo/pull/seven", "file:///etc/passwd"):
+        with pytest.raises(RuntimeError, match="pull request URL"):
+            testing._pull_request_number(url)
+    assert testing._pull_request_number("https://github.com/owner/repo/pull/53/") == "53"
+
+    for branch in (None, ""):
+        with pytest.raises(RuntimeError, match="does not record a branch"):
+            testing._checkout_branch(tmp_path, tmp_path, branch)
+
+
+def test_checkout_branch_requires_the_checkout_to_still_be_on_that_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Uncommitted engineer work is only trustworthy while the checkout still holds it."""
+    monkeypatch.setattr(testing, "_git_output", lambda *_args: "main")
+    with pytest.raises(RuntimeError, match="must still be on engineer branch feature"):
+        testing._checkout_branch(tmp_path, tmp_path, "feature")
+
+
+def test_worktree_path_is_contained_and_flattened(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worktree directory name comes from a sanitized slug, never from raw artifact text."""
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+    assert testing._worktree_path("Owner/Repo", "run-1") == Path(
+        "/projects/.repo-agent-worktrees/owner-repo/run-1"
+    )
+    with pytest.raises(RuntimeError, match="worktree directory"):
+        testing._worktree_path("../../", "run-1")
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "projects")
+    with pytest.raises(RuntimeError, match="absolute path"):
+        testing._worktree_path("owner/repo", "run-1")
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("Required test coverage reached. Total coverage: 91.63%\n", 91.63),
+        ("TOTAL   902   51   340   53   92%\n", 92.0),
+        ("statements covered: 84.5 %\n", 84.5),
+        ("no numbers here\n", None),
+    ],
+)
+def test_parse_coverage_reads_common_reporter_formats(output: str, expected: float | None) -> None:
+    assert testing._parse_coverage(output) == expected
+
+
+def test_record_coverage_fails_below_or_without_a_readable_minimum() -> None:
+    """A coverage minimum that is unmet or unreadable is a failure, never an implicit pass."""
+    below: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(below, "Total coverage: 71.20%", 90)
+    assert below["status"] == "failed"
+    assert "below the configured minimum" in str(below["error"])
+
+    unreadable: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(unreadable, "no percentage", 90)
+    assert unreadable["status"] == "failed"
+    assert unreadable["coverage_percent"] is None
+
+    unconfigured: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(unconfigured, "Total coverage: 12.00%", True)
+    assert unconfigured["status"] == "passed"
+    assert "minimum_coverage" not in unconfigured
+
+
+def test_run_gate_bounds_output_and_survives_bad_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gate that is missing, hanging, or not a command fails alone instead of raising."""
+    result, output = testing._run_gate("lint", "", tmp_path, 5)
+    assert result == {"gate": "lint", "status": "failed", "error": "lint gate is not a command"}
+    assert output == ""
+
+    def timeout(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutExpired(["make"], 5)
+
+    monkeypatch.setattr(testing, "run", timeout)
+    result, _ = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "failed"
+    assert "exceeded 5 seconds" in result["error"]
+
+    def missing(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("no such executable")
+
+    monkeypatch.setattr(testing, "run", missing)
+    result, _ = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "failed"
+    assert "no such executable" in result["error"]
+
+    monkeypatch.setattr(
+        testing,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="x" * 5_000, stderr=""),
+    )
+    result, output = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "passed"
+    assert result["stdout"].startswith("...truncated...")
+    assert len(result["stdout"]) < len(output)
+
+
+def test_gate_environment_hides_repository_write_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operator-configured repository commands must never inherit a GitHub write token."""
+    monkeypatch.setenv("GH_TOKEN", "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    environment = testing._gate_environment()
+    assert "GH_TOKEN" not in environment
+    assert "GITHUB_TOKEN" not in environment
+    assert environment["PATH"] == "/usr/bin"
+
+
+def test_gate_timeout_is_configurable_and_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert testing._gate_timeout() == 1800
+    monkeypatch.setenv("TEST_GATE_TIMEOUT_SECONDS", "60")
+    assert testing._gate_timeout() == 60
+    monkeypatch.setenv("TEST_GATE_TIMEOUT_SECONDS", "0")
+    with pytest.raises(RuntimeError, match="TEST_GATE_TIMEOUT_SECONDS"):
+        testing._gate_timeout()
+
+
+def test_preflight_details_only_supplies_a_matching_item(tmp_path: Path) -> None:
+    """A stale or unrelated preflight may not supply acceptance criteria for another item."""
+    assert testing._preflight_details(tmp_path, "item") == {}
+    path = tmp_path / "latest-engineer-preflight.json"
+    path.write_text(json.dumps(["not an object"]), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == {}
+    path.write_text(json.dumps({"work_item": {"id": "other"}}), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == {}
+    path.write_text(json.dumps({"work_item": {"id": "item"}}), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == {"work_item": {"id": "item"}}
+
+
+def test_remove_worktree_falls_back_to_deleting_the_directory(tmp_path: Path) -> None:
+    """Teardown may not depend on Git succeeding; the disposable directory must always go."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "file.txt").write_text("x", encoding="utf-8")
+    assert testing._remove_worktree(tmp_path / "missing-workspace", worktree) is True
+    assert not worktree.exists()
+
+
+def test_test_markdown_omits_an_empty_acceptance_criteria_section() -> None:
+    """A report without criteria must not render an empty heading a reviewer would trust."""
+    rendered = testing._test_markdown(
+        {
+            "status": "passed",
+            "execution_path": "/state/latest-engineer-execution.json",
+            "requested_item_id": "item",
+            "checkout": {"source": "engineer_branch", "head_commit": "abc"},
+            "worktree_removed": True,
+            "gates": [{"gate": "test", "status": "passed", "exit_code": 0}],
+        }
+    )
+    assert "Acceptance criteria" not in rendered
+    assert "`test`: **passed** — exit code 0" in rendered
