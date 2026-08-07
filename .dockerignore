@@ -9,3 +9,4 @@ secrets
 *.pem
 *.key
 *.env
+.coverage*

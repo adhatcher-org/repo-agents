@@ -16,7 +16,6 @@ import yaml
 
 from repo_agent.planning import _agent_configuration, _ollama_json
 
-
 _ELIGIBLE_DISPOSITIONS = frozenset({"approve", "approved", "remediate"})
 _TERMINAL_ACTIVE_STATUSES = frozenset({"blocked", "cancelled", "completed", "failed"})
 
@@ -208,7 +207,10 @@ def run_team_lead_dispatch() -> int:
                     raise RuntimeError("engineer handoff did not become ready_for_implementation")
                 handoff_path = state_dir / "latest-engineer-handoff.json"
                 handoff = json.loads(handoff_path.read_text(encoding="utf-8"))
-                if not isinstance(handoff, dict) or handoff.get("status") != "ready_for_implementation":
+                if (
+                    not isinstance(handoff, dict)
+                    or handoff.get("status") != "ready_for_implementation"
+                ):
                     raise RuntimeError("engineer handoff did not become ready_for_implementation")
                 active = {
                     "kind": "active_work_item",
