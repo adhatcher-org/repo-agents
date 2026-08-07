@@ -38,10 +38,18 @@ directory, and writes both a timestamped artifact under `$AGENT_STATE_DIR/runs/<
 ```
 run-once / daemon  → latest-inventory.json        (cli.py,        read-only GitHub inventory + team-lead report)
 plan-once          → latest-architect-plan.json   (planning.py,   architect + critic via Ollama)
+dispatch-once      → active-work-item.json        (engineering.py, selects ONE item, calls the handoff)
 engineer-handoff   → latest-engineer-handoff.json (engineering.py, one approved item, no repo access)
 engineer-preflight → latest-engineer-preflight.json (engineering.py, verifies clean checkout)
 engineer-execute   → latest-engineer-execution.json (engineering.py, branch + patch apply)
 ```
+
+`dispatch-once` is the serialization point. It refuses to assign anything while
+`active-work-item.json` exists with a non-terminal status (terminal = `blocked`, `cancelled`,
+`completed`, `failed`), so only one engineering job is ever in flight across all repositories. It
+picks the first architect item whose disposition is `approve`/`approved`/`remediate` **in plan
+order**, and treats an unreadable or malformed `active-work-item.json` as a hard blocker rather than
+falling through to a fresh assignment.
 
 Statuses are the gate between stages: a stage refuses to run unless the upstream artifact carries the
 exact expected status (`passed` → `approved` → `ready_for_implementation` → `ready_for_coding`) *and*
