@@ -1,6 +1,42 @@
-# Repo Agent read-only inventory controller
+# Repo Agent staged repository-maintenance pipeline
 
-This image runs a read-only GitHub inventory immediately and every 24 hours. It contains Python 3.13, Node 22, Git, GitHub CLI, and an Ollama health probe. It does not modify repositories, create branches, create pull requests, or merge code.
+This image runs a read-only GitHub inventory immediately and every 24 hours, and provides the later
+staged commands that plan, implement, and verify one approved maintenance item at a time. It
+contains Python 3.13, Node 22, Git, GitHub CLI, and an Ollama health probe.
+
+The long-running controller is read-only: it never modifies repositories, creates branches, creates
+pull requests, or merges code. The write-capable stages live in a separate, profile-only service
+that is excluded from `docker compose up` and must be invoked deliberately. That service can create
+a local branch, apply patches to a checkout, and execute repository code; it still never commits,
+pushes, opens pull requests, merges, or dismisses alerts.
+
+## Pipeline stages
+
+Every stage is a subcommand of the same `repo-agent` CLI. Each reads the previous stage's artifact
+from the state directory and writes both a timestamped artifact under `data/runs/<UTC>/` and a
+`latest-*.json` pointer at the state-directory root. Stages never talk to each other in-process —
+the pointer file *is* the interface, and every stage re-validates what it reads.
+
+| Command | Artifact | Service | Writes to a repository |
+| --- | --- | --- | --- |
+| `run-once` / `daemon` | `latest-inventory.json` | controller | no |
+| `plan-once` | `latest-architect-plan.json` | controller | no |
+| `dispatch-once` | `active-work-item.json` | controller | no |
+| `engineer-handoff` | `latest-engineer-handoff.json` | controller | no |
+| `engineer-preflight` | `latest-engineer-preflight.json` | engineer | no |
+| `engineer-execute` | `latest-engineer-execution.json` | engineer | branch + working tree |
+| `test-execute` | `latest-test-report.json` | engineer | disposable worktree only |
+
+Stages that produce operator-facing evidence also write a Markdown companion beside the JSON —
+`latest-team-lead-report.md`, `latest-architect-plan.md`, `latest-team-lead-dispatch.md`,
+`latest-engineer-handoff.md`, and `latest-test-report.md`. The JSON is the machine interface; the
+Markdown is for review.
+
+A stage refuses to run unless the upstream artifact carries the exact expected status *and* its
+work-item ID matches the `--item` argument. Failures are never raised to the caller: a stage records
+`status: "blocked"` with an error string, still writes its artifact, and exits 1.
+
+The PR-review, publish, and CI-monitor stages in `docs/remainingwork.md` are not implemented yet.
 
 ## Python dependency management
 
@@ -14,11 +50,18 @@ Each role has an individual Markdown definition in `agents/`. The front matter d
 docker exec repo-agent repo-agent agents
 ```
 
-`team_lead`, `senior_architect`, and `senior_architect_critic` are active in the read-only
-inventory/planning milestone. The software engineer can now prepare and execute one selected,
-approved item, and `test_agent` is an active deterministic executor that verifies the result. The
-PR-review and CI-monitor roles remain deliberately planned until their isolated write and
-verification boundaries are implemented.
+Five roles are active. `senior_architect`, `senior_architect_critic`, and
+`senior_software_engineer` are Ollama roles: their Markdown body is the system prompt and their
+front matter sets the model, temperature, and timeout. `team_lead` and `test_agent` are active but
+deterministic — they declare `provider: none`, are never sent to a model, and their bodies document
+the role's authority boundary rather than prompting it.
+
+`pr_reviewer` and `ci_monitor` remain `status: planned`; their stages are not implemented.
+
+The `status` field is currently descriptive metadata reported by `repo-agent agents`. It is not
+enforced — `_agent_configuration` validates provider, model, temperature, and timeout, but does not
+refuse a definition marked `planned`. Treat the roster listing as documentation of intent, not as a
+guarantee about what can execute.
 
 ## Architect and critic planning stage
 
@@ -56,9 +99,17 @@ docker exec repo-agent repo-agent dispatch-once
 
 The dispatcher evaluates architect-plan items in their declared order and only accepts explicit
 `approve`, `approved`, or `remediate` dispositions. It records its selection in
-`data/active-work-item.json`, calls the existing read-only engineer handoff, and writes JSON and
-Markdown dispatch reports. It will not assign another item until a later workflow stage records a
-terminal active-item status. The daily inventory daemon does not dispatch work automatically.
+`data/active-work-item.json` with `status: "assigned"`, calls the read-only engineer handoff, and
+writes JSON and Markdown dispatch reports. The daily inventory daemon does not dispatch work
+automatically.
+
+**Known limitation.** `dispatch-once` refuses to assign a second item while `active-work-item.json`
+holds a non-terminal status, and no stage currently updates that file after the dispatcher writes
+it. `assigned` is not terminal, so every later `dispatch-once` reports `already_assigned` until the
+file is edited or removed by hand. Advancing the active item as its stage reports complete — and
+only selecting the next item once the prior one is terminal — is specified in
+`docs/remainingwork.md` but not yet implemented. Until it is, treat the pipeline as single-shot per
+plan and clear `data/active-work-item.json` deliberately between items.
 
 ## Senior software engineer handoff
 
@@ -222,4 +273,24 @@ Start through the Unraid Docker Compose UI. The controller remains running and w
 
 - The image runs as UID/GID `1000`, has a read-only root filesystem, drops Linux capabilities, and needs no Docker socket.
 - The GitHub token is supplied from a read-only `/run/secrets/github-token` mount; never put it in the image, Compose file, `.env`, or repository config.
-- Tests will eventually execute repository code. The future test worker must not receive the controller's GitHub App key or other long-lived secrets.
+- Model output and operator configuration are both treated as untrusted input. Every Ollama response
+  is validated against a hand-written contract before it can affect anything, and no configured or
+  model-supplied string is ever handed to a shell.
+
+### Open risk: gate commands execute repository code
+
+`test-execute` runs the configured `quality_gates` against the code under test. For an
+`existing_pull_request_ready_for_testing` item that code is, by design, written by the pull
+request's author — which is the Dependabot and fork case this pipeline exists to service.
+
+Those commands currently run inside `repo-agent-engineer`, the service that also holds the
+write-capable `se-gh-token` and a read-write `/projects` mount of every configured checkout, and
+that can reach the state directory. `test-execute` strips `GH_TOKEN`, `GITHUB_TOKEN`, and
+`GH_ENTERPRISE_TOKEN` from the gate environment, but the token is also present as a *file* mount,
+and `cap_drop: ALL` does not help because no privilege escalation is required.
+
+The defensive work in `test-execute` — treating gate stdout as hostile, refusing to derive coverage
+from it alone — reduces what a hostile gate can fake in a report. It does not contain a gate that
+simply writes to the mounts it can already reach. Before pointing this stage at a third-party pull
+request, gates should run in a minimal isolated container with no secret mounts, no state
+directory, no `/projects`, and no network — with only the disposable worktree bound in.
