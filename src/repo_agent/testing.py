@@ -10,7 +10,7 @@ import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from subprocess import TimeoutExpired, run
+from subprocess import CalledProcessError, TimeoutExpired, run
 from typing import Any
 
 from repo_agent.engineering import (
@@ -28,12 +28,21 @@ _TESTABLE_STATUSES = frozenset(
 _OUTPUT_LIMIT = 4_000
 _WORKTREE_DIRECTORY = ".repo-agent-worktrees"
 _REDACTED_ENVIRONMENT = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN")
-_PULL_REQUEST_URL = re.compile(r"^https?://[^/\s]+/[^/\s]+/[^/\s]+/pull/(\d+)/?$")
-_COVERAGE_PATTERNS = (
-    re.compile(r"total coverage:\s*([0-9]+(?:\.[0-9]+)?)\s*%", re.IGNORECASE),
-    re.compile(r"^TOTAL\b.*?([0-9]+(?:\.[0-9]+)?)%", re.MULTILINE),
-    re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*%"),
-)
+_PULL_REQUEST_URL = re.compile(r"^https?://[^/\s]+/([^/\s]+)/([^/\s]+)/pull/(\d+)/?$")
+_COVERAGE_ARTIFACTS = ("coverage.json", "coverage.xml")
+_COVERAGE_FILE_LIMIT = 8_000_000
+_COVERAGE_TOTAL_LINE = re.compile(r"^TOTAL\s+.*?([0-9]+(?:\.[0-9]+)?)%", re.MULTILINE)
+_COVERAGE_LINE_RATE = re.compile(r"<coverage\b[^>]*\bline-rate=\"([0-9]*\.?[0-9]+)\"")
+
+
+def _git_capture(directory: Path, arguments: list[str]) -> bytes:
+    """Run Git for byte-significant output; unlike `_git_output` nothing here is stripped."""
+    try:
+        completed = run(["git", "-C", str(directory), *arguments], check=True, capture_output=True)
+    except CalledProcessError as exc:
+        message = (exc.stderr or b"").decode("utf-8", "replace").strip() or "unknown git failure"
+        raise RuntimeError(f"git {' '.join(arguments[:2])} failed: {message}") from exc
+    return completed.stdout
 
 
 def _gate_timeout() -> int:
@@ -69,7 +78,7 @@ def _preflight_details(state_dir: Path, item_id: str) -> dict[str, Any]:
         )
     except (OSError, json.JSONDecodeError):
         return {}
-    if not isinstance(preflight, dict):
+    if not isinstance(preflight, dict) or preflight.get("status") != "ready_for_coding":
         return {}
     work_item = preflight.get("work_item")
     if not isinstance(work_item, dict) or work_item.get("id") != item_id:
@@ -77,29 +86,36 @@ def _preflight_details(state_dir: Path, item_id: str) -> dict[str, Any]:
     return preflight
 
 
-def _pull_request_number(url: object) -> str:
-    """Accept only a literal GitHub pull-request URL before it reaches a Git refspec."""
+def _pull_request_number(url: object, repository: str) -> str:
+    """Bind the pull request to the configured slug before its number reaches a Git refspec."""
     if not isinstance(url, str):
         raise RuntimeError("engineer execution does not record a pull request URL")
     match = _PULL_REQUEST_URL.match(url.strip())
     if match is None:
         raise RuntimeError(f"engineer execution pull request URL is not supported: {url}")
-    return match.group(1)
+    owner, name, number = match.groups()
+    if f"{owner}/{name}".lower() != repository.lower():
+        raise RuntimeError(
+            f"pull request URL does not belong to the configured repository {repository}: {url}"
+        )
+    return number
 
 
-def _checkout_pull_request(workspace: Path, worktree: Path, url: object) -> dict[str, Any]:
+def _checkout_pull_request(
+    workspace: Path, worktree: Path, url: object, repository: str
+) -> dict[str, Any]:
     """Test the pull request's own head commit, fetched without changing any local branch."""
-    number = _pull_request_number(url)
+    number = _pull_request_number(url, repository)
     _git_output(workspace, ["fetch", "--no-tags", "--force", "origin", f"pull/{number}/head"])
     head = _git_output(workspace, ["rev-parse", "FETCH_HEAD"])
     _git_output(workspace, ["worktree", "add", "--detach", str(worktree), head])
     return {"source": "existing_pull_request", "pull_request_url": url, "head_commit": head}
 
 
-def _apply_pending(worktree: Path, diff: str) -> None:
-    """Reproduce the engineer's changes in the disposable worktree only."""
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".patch") as patch_file:
-        patch_file.write(diff + "\n")
+def _apply_pending(worktree: Path, diff: bytes) -> None:
+    """Apply the engineer's diff byte-for-byte; trailing whitespace and base85 blocks are data."""
+    with tempfile.NamedTemporaryFile(mode="wb", suffix=".patch") as patch_file:
+        patch_file.write(diff)
         patch_file.flush()
         _git_output(worktree, ["apply", "--whitespace=nowarn", patch_file.name])
 
@@ -117,12 +133,15 @@ def _worktree_destination(worktree: Path, relative: str) -> Path:
 
 def _copy_untracked(workspace: Path, worktree: Path) -> tuple[list[str], list[str]]:
     """Carry new files into the worktree; `git diff HEAD` reports only tracked paths."""
-    listed = _git_output(workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    listed = _git_capture(workspace, ["ls-files", "--others", "--exclude-standard", "-z"])
+    entries = listed.split(b"\0")
+    if entries and entries[-1] == b"":
+        entries.pop()
     copied: list[str] = []
     skipped: list[str] = []
-    for entry in listed.split("\0"):
-        if not entry:
-            continue
+    for raw in entries:
+        # NUL-delimited output is byte-exact, so leading and trailing spaces are part of the name.
+        entry = os.fsdecode(raw)
         source = workspace / entry
         # Symlinks are not copied: their target is resolved by the reader, not by this stage.
         if source.is_symlink() or not source.is_file():
@@ -147,7 +166,7 @@ def _checkout_branch(workspace: Path, worktree: Path, branch: object) -> dict[st
         )
     head = _git_output(workspace, ["rev-parse", "HEAD"])
     _git_output(workspace, ["worktree", "add", "--detach", str(worktree), head])
-    pending = _git_output(workspace, ["diff", "--binary", "HEAD"])
+    pending = _git_capture(workspace, ["diff", "--binary", "HEAD"])
     if pending:
         _apply_pending(worktree, pending)
     copied, skipped = _copy_untracked(workspace, worktree)
@@ -161,10 +180,14 @@ def _checkout_branch(workspace: Path, worktree: Path, branch: object) -> dict[st
     }
 
 
-def _checkout(workspace: Path, worktree: Path, execution: dict[str, Any]) -> dict[str, Any]:
+def _checkout(
+    workspace: Path, worktree: Path, execution: dict[str, Any], repository: str
+) -> dict[str, Any]:
     """Route the two upstream shapes already accepted by the caller's status guard."""
     if execution["status"] == "existing_pull_request_ready_for_testing":
-        return _checkout_pull_request(workspace, worktree, execution.get("pull_request_url"))
+        return _checkout_pull_request(
+            workspace, worktree, execution.get("pull_request_url"), repository
+        )
     return _checkout_branch(workspace, worktree, execution.get("branch"))
 
 
@@ -184,8 +207,15 @@ def _run_gate(
         return {"gate": name, "status": "failed", "error": f"{name} gate is not a command"}, ""
     result: dict[str, Any] = {"gate": name, "command": command}
     try:
+        arguments = shlex.split(command)
+    except ValueError as exc:
+        result.update(
+            {"status": "failed", "error": f"{name} gate is not a parsable command: {exc}"}
+        )
+        return result, ""
+    try:
         completed = run(
-            shlex.split(command),
+            arguments,
             cwd=str(worktree),
             capture_output=True,
             text=True,
@@ -210,25 +240,65 @@ def _run_gate(
     return result, completed.stdout + completed.stderr
 
 
-def _parse_coverage(output: str) -> float | None:
-    """Read a total coverage percentage from gate output without trusting its exact format."""
-    for pattern in _COVERAGE_PATTERNS:
-        matches = pattern.findall(output)
-        if matches:
-            return float(matches[-1])
-    return None
+def _coverage_from_file(path: Path) -> float | None:
+    """Read a total from a coverage report file; an absent or unreadable file is not a total."""
+    try:
+        if path.stat().st_size > _COVERAGE_FILE_LIMIT:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if path.suffix == ".json":
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        totals = payload.get("totals") if isinstance(payload, dict) else None
+        percent = totals.get("percent_covered") if isinstance(totals, dict) else None
+        if isinstance(percent, bool) or not isinstance(percent, int | float):
+            return None
+        return float(percent)
+    # Cobertura's line-rate is read with a narrow pattern rather than an XML parser, so a
+    # repository-authored report cannot reach entity expansion or external-entity handling.
+    match = _COVERAGE_LINE_RATE.search(text)
+    return round(float(match.group(1)) * 100, 2) if match else None
 
 
-def _record_coverage(result: dict[str, Any], output: str, minimum: object) -> None:
-    """Treat an unmet or unreadable coverage minimum as a failure rather than a silent pass."""
-    percent = _parse_coverage(output)
+def _parse_coverage(output: str) -> list[float]:
+    """Collect distinct anchored TOTAL percentages; the caller refuses to choose between them."""
+    return sorted({float(value) for value in _COVERAGE_TOTAL_LINE.findall(output)})
+
+
+def _record_coverage(result: dict[str, Any], output: str, worktree: Path, minimum: object) -> None:
+    """Prefer a machine-readable coverage report over the gate's own stdout, and never guess.
+
+    The report file is still produced under repository-controlled configuration, so this narrows
+    the surface a pull request can use to fake a total; it does not eliminate it.
+    """
+    percent: float | None = None
+    source = "unavailable"
+    for name in _COVERAGE_ARTIFACTS:
+        percent = _coverage_from_file(worktree / name)
+        if percent is not None:
+            source = name
+            break
+    conflicting: list[float] = []
+    if percent is None:
+        conflicting = _parse_coverage(output)
+        if len(conflicting) == 1:
+            percent, source = conflicting[0], "gate_output"
     result["coverage_percent"] = percent
-    if not isinstance(minimum, int | float) or isinstance(minimum, bool):
+    result["coverage_source"] = source
+    if len(conflicting) > 1:
+        result["status"] = "failed"
+        result["error"] = f"coverage gate reported conflicting totals: {conflicting}"
+        return
+    if isinstance(minimum, bool) or not isinstance(minimum, int | float):
         return
     result["minimum_coverage"] = minimum
     if percent is None:
         result["status"] = "failed"
-        result["error"] = "coverage gate output did not report a total percentage"
+        result["error"] = "coverage gate did not report a readable total percentage"
     elif percent < float(minimum):
         result["status"] = "failed"
         result["error"] = f"coverage {percent}% is below the configured minimum {minimum}%"
@@ -245,9 +315,18 @@ def _run_gates(gates: dict[str, Any], worktree: Path) -> list[dict[str, Any]]:
             continue
         result, output = _run_gate(name, gates[name], worktree, timeout)
         if name == "coverage":
-            _record_coverage(result, output, minimum)
+            _record_coverage(result, output, worktree, minimum)
         results.append(result)
     return results
+
+
+def _overall_status(results: list[dict[str, Any]]) -> str:
+    """Never let a bare `passed` mean that the gates which matter were not configured."""
+    if any(gate["status"] == "failed" for gate in results):
+        return "failed"
+    if any(gate["status"] == "skipped" for gate in results):
+        return "passed_partial"
+    return "passed"
 
 
 def _remove_worktree(workspace: Path, worktree: Path) -> bool:
@@ -285,6 +364,11 @@ def _test_markdown(report: dict[str, Any]) -> str:
             f"- Worktree removed: {report.get('worktree_removed')}",
         ]
     )
+    if report.get("worktree_removed") is False:
+        lines.append(
+            "- **The disposable worktree could not be removed.** It still holds the code under "
+            f"test at `{report.get('worktree_path')}` and needs operator cleanup."
+        )
     if checkout.get("untracked_files_copied"):
         lines.append(
             "- New files tested: "
@@ -300,6 +384,8 @@ def _test_markdown(report: dict[str, Any]) -> str:
         detail = gate.get("error") or f"exit code {gate.get('exit_code')}"
         if gate["status"] == "skipped":
             detail = "not configured in quality_gates"
+        if gate.get("coverage_source"):
+            detail += f" (total read from {gate['coverage_source']})"
         lines.append(f"- `{gate['gate']}`: **{gate['status']}** — {detail}")
     criteria = report.get("architect_decision", {}).get("acceptance_criteria", [])
     if criteria:
@@ -309,74 +395,10 @@ def _test_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_test_execute(item_id: str) -> int:
-    """Run configured quality gates in a disposable worktree; never publish or change the repo."""
-    timestamp = datetime.now(UTC)
-    state_dir = Path(os.environ["AGENT_STATE_DIR"])
-    execution_path = state_dir / "latest-engineer-execution.json"
-    report: dict[str, Any] = {
-        "kind": "test_agent_execution",
-        "started_at": timestamp.isoformat(),
-        "mode": "disposable_worktree_no_publish",
-        "requested_item_id": item_id,
-        "execution_path": str(execution_path),
-        "status": "blocked",
-    }
-    try:
-        execution = json.loads(execution_path.read_text(encoding="utf-8"))
-        if not isinstance(execution, dict):
-            raise RuntimeError("latest engineer execution must be a JSON object")
-        if execution.get("requested_item_id") != item_id:
-            raise RuntimeError("latest engineer execution does not match the requested work item")
-        if execution.get("status") not in _TESTABLE_STATUSES:
-            raise RuntimeError(
-                f"latest engineer execution is not ready for testing: {execution.get('status')}"
-            )
-        repository = execution.get("repository")
-        if not isinstance(repository, str):
-            raise RuntimeError("latest engineer execution does not name a repository")
-        metadata = _load_repository_info().get(repository)
-        if metadata is None:
-            raise RuntimeError(f"repository is not configured for execution: {repository}")
-        workspace = _workspace_path(repository, metadata)
-        if str(workspace) != execution.get("workspace_path"):
-            raise RuntimeError("engineer execution workspace does not match repository metadata")
-        gates = metadata.get("quality_gates")
-        if not isinstance(gates, dict) or not any(name in gates for name in _GATE_ORDER):
-            raise RuntimeError(f"repository metadata configures no quality gates: {repository}")
-
-        preflight = _preflight_details(state_dir, item_id)
-        work_item = execution.get("work_item")
-        if not isinstance(work_item, dict) or work_item.get("id") != item_id:
-            work_item = preflight.get("work_item", {})
-        decision = execution.get("architect_decision")
-        if not isinstance(decision, dict):
-            decision = preflight.get("architect_decision", {})
-
-        run_id = timestamp.strftime("%Y%m%dT%H%M%SZ")
-        worktree = _worktree_path(repository, run_id)
-        report.update(
-            {
-                "repository": repository,
-                "workspace_path": str(workspace),
-                "worktree_path": str(worktree),
-                "work_item": work_item,
-                "architect_decision": decision,
-            }
-        )
-        worktree.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            report["checkout"] = _checkout(workspace, worktree, execution)
-            results = _run_gates(gates, worktree)
-        finally:
-            report["worktree_removed"] = _remove_worktree(workspace, worktree)
-        report["gates"] = results
-        report["status"] = (
-            "failed" if any(gate["status"] == "failed" for gate in results) else "passed"
-        )
-    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
-        report["error"] = str(exc)
-
+def _persist_report(report: dict[str, Any], state_dir: Path, timestamp: datetime) -> None:
+    """Write the artifact on every exit path; a stale `latest-*` pointer would be read as fresh."""
+    if report["status"] == "blocked" and "error" not in report:
+        report["error"] = "the test stage was interrupted before it completed"
     report["completed_at"] = datetime.now(UTC).isoformat()
     run_dir = state_dir / "runs" / timestamp.strftime("%Y%m%dT%H%M%SZ")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -398,4 +420,85 @@ def run_test_execute(item_id: str) -> int:
             }
         )
     )
+
+
+def run_test_execute(item_id: str) -> int:
+    """Run configured quality gates in a disposable worktree; never publish or change the repo."""
+    timestamp = datetime.now(UTC)
+    state_dir = Path(os.environ["AGENT_STATE_DIR"])
+    execution_path = state_dir / "latest-engineer-execution.json"
+    report: dict[str, Any] = {
+        "kind": "test_agent_execution",
+        "started_at": timestamp.isoformat(),
+        "mode": "disposable_worktree_no_publish",
+        "requested_item_id": item_id,
+        "execution_path": str(execution_path),
+        "status": "blocked",
+    }
+    try:
+        _execute_gates(report, item_id, state_dir, execution_path, timestamp)
+    # json.JSONDecodeError is a ValueError, as is an unbalanced quote in a configured gate.
+    except (OSError, RuntimeError, ValueError) as exc:
+        report["error"] = str(exc)
+    finally:
+        # Unconditional: an interrupt must not leave the previous run's pointer standing.
+        _persist_report(report, state_dir, timestamp)
     return 1 if report["status"] == "blocked" else 0
+
+
+def _execute_gates(
+    report: dict[str, Any],
+    item_id: str,
+    state_dir: Path,
+    execution_path: Path,
+    timestamp: datetime,
+) -> None:
+    """Fill in the verdict; the caller owns error capture and writing the artifact."""
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    if not isinstance(execution, dict):
+        raise RuntimeError("latest engineer execution must be a JSON object")
+    if execution.get("requested_item_id") != item_id:
+        raise RuntimeError("latest engineer execution does not match the requested work item")
+    if execution.get("status") not in _TESTABLE_STATUSES:
+        raise RuntimeError(
+            f"latest engineer execution is not ready for testing: {execution.get('status')}"
+        )
+    repository = execution.get("repository")
+    if not isinstance(repository, str):
+        raise RuntimeError("latest engineer execution does not name a repository")
+    metadata = _load_repository_info().get(repository)
+    if metadata is None:
+        raise RuntimeError(f"repository is not configured for execution: {repository}")
+    workspace = _workspace_path(repository, metadata)
+    if str(workspace) != execution.get("workspace_path"):
+        raise RuntimeError("engineer execution workspace does not match repository metadata")
+    gates = metadata.get("quality_gates")
+    if not isinstance(gates, dict) or "test" not in gates:
+        raise RuntimeError(f"repository metadata must configure a test quality gate: {repository}")
+
+    preflight = _preflight_details(state_dir, item_id)
+    work_item = execution.get("work_item")
+    if not isinstance(work_item, dict) or work_item.get("id") != item_id:
+        work_item = preflight.get("work_item", {})
+    decision = execution.get("architect_decision")
+    if not isinstance(decision, dict):
+        decision = preflight.get("architect_decision", {})
+
+    worktree = _worktree_path(repository, timestamp.strftime("%Y%m%dT%H%M%SZ"))
+    report.update(
+        {
+            "repository": repository,
+            "workspace_path": str(workspace),
+            "worktree_path": str(worktree),
+            "work_item": work_item,
+            "architect_decision": decision,
+        }
+    )
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        report["checkout"] = _checkout(workspace, worktree, execution, repository)
+        results = _run_gates(gates, worktree)
+    finally:
+        report["worktree_removed"] = _remove_worktree(workspace, worktree)
+    report["gates"] = results
+    report["status"] = _overall_status(results)
