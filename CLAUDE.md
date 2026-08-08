@@ -112,6 +112,14 @@ framing in any new agent definition.
 `shlex.split` and runs them with no `shell=True`, a bounded per-gate timeout
 (`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and GitHub tokens stripped from the child environment.
 Keep that discipline: no stage may hand a configured or model-supplied string to a shell.
+`shlex.split` raises `ValueError` on an unbalanced quote, so `test-execute` catches `ValueError`
+too — and writes its artifact in a `finally`, since a stage that returns without writing leaves the
+previous run's `latest-*.json` to be read as the current verdict.
+
+Gate *output* is repository-controlled, so nothing that gates a decision may be derived from it
+alone. `minimum_coverage` exists as the operator's independent check on a PR that edits the
+project's own coverage threshold; it reads `coverage.json`/`coverage.xml` in preference to stdout,
+counts only anchored `TOTAL` rows, and fails on disagreeing totals instead of picking one.
 
 ### Config files
 
@@ -136,11 +144,22 @@ PR diff reaches the later test stage instead of a regenerated patch.
 `<ENGINEER_REPOSITORY_ROOT>/.repo-agent-worktrees/<repository>/<run-id>` and removes it in a
 `finally`, on success and failure alike. It reads the configured checkout (to fetch a PR head, or to
 export the engineer branch's still-uncommitted `git diff --binary HEAD` *and* copy in the untracked
-files that diff cannot express) but never changes it — not the working tree, not the index — and it
-does not commit,
-push, open a PR, merge, or dismiss alerts. A gate absent from `quality_gates` is reported as
-`skipped`, never as a pass. Don't add publishing side effects to existing stages; they belong to the
-not-yet-implemented review/publish/CI roles.
+files that diff cannot express) and never changes its working tree or index. It *does* write Git
+metadata there, unavoidably for a worktree-based executor: `git fetch` writes `FETCH_HEAD` and
+fetched objects, and `git worktree add`/`remove` create and delete `.git/worktrees/<run-id>`. No ref
+is ever created, moved, or deleted, and it does not commit, push, open a PR, merge, or dismiss
+alerts.
+
+A gate absent from `quality_gates` is reported as `skipped`, never as a pass — and because a bare
+`passed` must not mean "nothing ran", a repository without a `test` gate blocks, and any run with a
+skipped gate reports `passed_partial` rather than `passed`. Don't add publishing side effects to
+existing stages; they belong to the not-yet-implemented review/publish/CI roles.
+
+Two output streams from that stage are byte-significant and must not go through
+`engineering._git_output`, whose trailing `.strip()` is correct only for scalars like a SHA:
+`git diff --binary HEAD` (stripping drops trailing whitespace on the final `+` line and the blank
+line terminating a base85 block) and `git ls-files -z` (stripping eats a leading space in a
+filename). Both use `testing._git_capture`, which returns raw bytes.
 
 ## Style
 

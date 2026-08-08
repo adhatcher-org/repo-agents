@@ -151,15 +151,26 @@ file transferred either way. Any other upstream status is a blocker.
 
 Only configured gates run, in the order `bootstrap`, `format`, `lint`, `test`, `coverage`,
 `security`. Each gate's command, exit code, and truncated output are recorded; a gate that is not
-configured is reported as `skipped` and never as a pass. The `coverage` gate's parsed percentage is
-compared against `minimum_coverage`, and an unmet or unreadable percentage fails it. Gate commands
-come from operator configuration, so they are split with `shlex` and run with no shell, a bounded
-timeout (`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and no GitHub token in their environment.
+configured is reported as `skipped` and never as a pass, and a repository without a `test` gate is
+refused outright. Gate commands come from operator configuration, so they are split with `shlex` and
+run with no shell, a bounded timeout (`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and no GitHub
+token in their environment; a command `shlex` cannot parse fails that gate rather than the run.
+
+`minimum_coverage` is the operator's independent backstop against a pull request that edits the
+project's own coverage threshold, so the percentage is read from a machine-readable `coverage.json`
+or `coverage.xml` in preference to the gate's stdout. That file is still generated under
+repository-controlled configuration, so this narrows what a pull request can fake rather than
+closing it. When only stdout is available, one anchored `TOTAL` row is accepted and two disagreeing
+rows fail the gate.
 
 Reports are written to `test-report.json`/`test-report.md` in the run directory and to
-`latest-test-report.json`/`latest-test-report.md`, with status `passed`, `failed`, or `blocked`. The
-disposable worktree is always removed. The stage never modifies the configured checkout, commits,
-pushes, creates pull requests, merges, or dismisses alerts.
+`latest-test-report.json`/`latest-test-report.md`, on every exit path including an interrupt — a
+stale pointer would otherwise be read as the current verdict. Status is `passed` (all six gates ran
+and passed), `passed_partial` (nothing failed but a gate was unconfigured), `failed`, or `blocked`.
+The disposable worktree is always removed, and a removal failure is called out in the report for
+operator cleanup. The stage never changes the configured checkout's working tree or index, commits,
+pushes, creates pull requests, merges, or dismisses alerts; it does write `.git` metadata there
+(`FETCH_HEAD`, fetched objects, `.git/worktrees/<run-id>`), without touching any ref.
 
 ## Run through Unraid Compose
 
