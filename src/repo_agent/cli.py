@@ -23,6 +23,7 @@ from repo_agent.engineering import (
     run_team_lead_dispatch,
 )
 from repo_agent.planning import run_planning
+from repo_agent.testing import run_test_execute
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -414,10 +415,11 @@ def main() -> None:
             "health",
             "plan-once",
             "run-once",
+            "test-execute",
             "version",
         ),
     )
-    parser.add_argument("--item", help="exact approved work-item ID for engineer-handoff")
+    parser.add_argument("--item", help="exact approved work-item ID for an item-scoped stage")
     args = parser.parse_args()
 
     if args.command == "version":
@@ -444,6 +446,10 @@ def main() -> None:
         if not args.item:
             parser.error("engineer-execute requires --item <approved-work-item-id>")
         sys.exit(run_engineer_execute(args.item))
+    if args.command == "test-execute":
+        if not args.item:
+            parser.error("test-execute requires --item <approved-work-item-id>")
+        sys.exit(run_test_execute(args.item))
     if args.command == "daemon":
         sys.exit(daemon())
     sys.exit(health())

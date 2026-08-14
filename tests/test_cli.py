@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from subprocess import CalledProcessError
+from subprocess import CalledProcessError, TimeoutExpired
 from types import SimpleNamespace
 from urllib.error import URLError
 from urllib.request import Request
 
 import pytest
 
-from repo_agent import cli, engineering, planning
+from repo_agent import cli, engineering, planning, testing
 
 
 class _Response:
@@ -1427,6 +1429,7 @@ def test_main_routes_itemless_commands_to_their_stage(
         ("engineer-handoff", "run_engineer_handoff"),
         ("engineer-preflight", "run_engineer_preflight"),
         ("engineer-execute", "run_engineer_execute"),
+        ("test-execute", "run_test_execute"),
     ],
 )
 def test_main_forwards_the_exact_item_to_engineer_stages(
@@ -1444,7 +1447,9 @@ def test_main_forwards_the_exact_item_to_engineer_stages(
     assert result.value.code == 0
 
 
-@pytest.mark.parametrize("command", ["engineer-handoff", "engineer-preflight", "engineer-execute"])
+@pytest.mark.parametrize(
+    "command", ["engineer-handoff", "engineer-preflight", "engineer-execute", "test-execute"]
+)
 def test_main_refuses_an_engineer_stage_without_an_item(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], command: str
 ) -> None:
@@ -1456,3 +1461,902 @@ def test_main_refuses_an_engineer_stage_without_an_item(
 
     assert result.value.code == 2
     assert "requires --item" in capsys.readouterr().err
+
+
+def _git_command(path: Path, *arguments: str) -> str:
+    """Drive the fixture repository directly, outside the code under test."""
+    completed = subprocess.run(
+        ["git", "-C", str(path), *arguments], check=True, capture_output=True, text=True
+    )
+    return completed.stdout.strip()
+
+
+def _testing_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gates: dict[str, object]
+) -> tuple[Path, Path]:
+    """Build a real checkout, bare origin, repository metadata, and state directory."""
+    projects = tmp_path / "projects"
+    workspace = projects / "repo"
+    workspace.mkdir(parents=True)
+    _git_command(workspace, "init", "-b", "main")
+    _git_command(workspace, "config", "user.email", "agent@example.test")
+    _git_command(workspace, "config", "user.name", "Repo Agent")
+    (workspace / "marker.txt").write_text("main-head\n", encoding="utf-8")
+    (workspace / "coverage.txt").write_text("TOTAL     100     5    95%\n", encoding="utf-8")
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "seed")
+    _git_command(workspace, "clone", "--bare", str(workspace), str(tmp_path / "origin.git"))
+    _git_command(workspace, "remote", "add", "origin", str(tmp_path / "origin.git"))
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    info_path = tmp_path / "repo-info.yml"
+    info_path.write_text(
+        json.dumps(
+            {
+                "repositories": [
+                    {
+                        "slug": "owner/repo",
+                        "path": str(workspace),
+                        "default_branch": "main",
+                        "quality_gates": gates,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AGENT_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("AGENT_REPOSITORY_INFO", str(info_path))
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", str(projects))
+    return workspace, state_dir
+
+
+def _write_execution(state_dir: Path, execution: dict[str, object]) -> None:
+    (state_dir / "latest-engineer-execution.json").write_text(
+        json.dumps(execution), encoding="utf-8"
+    )
+
+
+def test_test_execute_runs_configured_gates_against_an_existing_pull_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An existing PR is verified at its own head, with unconfigured gates recorded as skipped."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat marker.txt", "coverage": "cat coverage.txt", "minimum_coverage": 90},
+    )
+    _git_command(workspace, "switch", "-c", "pull-source")
+    (workspace / "marker.txt").write_text("pull-request-head\n", encoding="utf-8")
+    _git_command(workspace, "commit", "-am", "pull request change")
+    _git_command(workspace, "push", str(tmp_path / "origin.git"), "HEAD:refs/pull/7/head")
+    _git_command(workspace, "switch", "main")
+    _git_command(workspace, "branch", "-D", "pull-source")
+    _write_execution(
+        state_dir,
+        {
+            "status": "existing_pull_request_ready_for_testing",
+            "requested_item_id": "owner/repo:pr:7",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "work_item": {"id": "owner/repo:pr:7", "kind": "open_pull_request"},
+            "architect_decision": {"acceptance_criteria": ["Every configured gate passes"]},
+            "pull_request_url": "https://github.com/owner/repo/pull/7",
+        },
+    )
+
+    assert testing.run_test_execute("owner/repo:pr:7") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed_partial"
+    assert report["checkout"]["source"] == "existing_pull_request"
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "pull-request-head\n"
+    assert gates["coverage"]["coverage_percent"] == 95.0
+    assert gates["coverage"]["coverage_source"] == "gate_output"
+    assert gates["coverage"]["minimum_coverage"] == 90
+    assert [name for name, gate in gates.items() if gate["status"] == "skipped"] == [
+        "bootstrap",
+        "format",
+        "lint",
+        "security",
+    ]
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+    assert _git_command(workspace, "status", "--porcelain") == ""
+    assert _git_command(workspace, "branch", "--show-current") == "main"
+    markdown = (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+    assert "Every configured gate passes" in markdown
+    assert "`security`: **skipped**" in markdown
+    assert json.loads(capsys.readouterr().out)["status"] == "passed_partial"
+
+
+def test_test_execute_runs_the_engineer_branch_with_its_uncommitted_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A remediation branch is verified as the engineer left it, and one failing gate fails."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat marker.txt", "lint": "git rev-parse --verify missing-ref"},
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-1")
+    (workspace / "marker.txt").write_text("branch-head\n", encoding="utf-8")
+    _git_command(workspace, "commit", "-am", "branch change")
+    (workspace / "marker.txt").write_text("engineer-uncommitted\n", encoding="utf-8")
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:1",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-1",
+        },
+    )
+    (state_dir / "latest-engineer-preflight.json").write_text(
+        json.dumps(
+            {
+                "status": "ready_for_coding",
+                "work_item": {"id": "owner/repo:alert:1", "repository": "owner/repo"},
+                "architect_decision": {"acceptance_criteria": ["Patch the vulnerable dependency"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert testing.run_test_execute("owner/repo:alert:1") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["checkout"]["uncommitted_changes_applied"] is True
+    assert report["work_item"]["id"] == "owner/repo:alert:1"
+    assert report["architect_decision"]["acceptance_criteria"] == [
+        "Patch the vulnerable dependency"
+    ]
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "engineer-uncommitted\n"
+    assert gates["lint"]["status"] == "failed"
+    assert gates["lint"]["exit_code"] != 0
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+
+
+def test_test_execute_removes_the_worktree_when_a_gate_run_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The disposable worktree is created, then discarded even when the stage blocks."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-2")
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:2",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-2",
+        },
+    )
+    observed: list[bool] = []
+
+    def explode(_gates: dict[str, object], worktree: Path) -> list[dict[str, object]]:
+        observed.append((worktree / "marker.txt").is_file())
+        raise RuntimeError("gate runner exploded")
+
+    monkeypatch.setattr(testing, "_run_gates", explode)
+
+    assert testing.run_test_execute("owner/repo:alert:2") == 1
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert observed == [True]
+    assert report["status"] == "blocked"
+    assert report["error"] == "gate runner exploded"
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+    assert "## Blocker" in (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("execution", "message"),
+    [
+        ({"requested_item_id": "other", "status": "implementation_applied"}, "does not match"),
+        ({"requested_item_id": "item", "status": "blocked"}, "not ready for testing"),
+        ({"requested_item_id": "item", "status": "implementation_applied"}, "does not name a repo"),
+        ("not an object", "must be a JSON object"),
+    ],
+)
+def test_test_execute_blocks_an_unusable_upstream_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, execution: object, message: str
+) -> None:
+    """Only a matching, testable engineer execution may reach a repository checkout."""
+    monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
+    _write_execution(tmp_path, execution)  # type: ignore[arg-type]
+
+    assert testing.run_test_execute("item") == 1
+
+    report = json.loads((tmp_path / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert message in report["error"]
+
+
+@pytest.mark.parametrize(
+    ("gates", "message"),
+    [
+        ({"minimum_coverage": 90}, "must configure a test quality gate"),
+        ({"bootstrap": "true"}, "must configure a test quality gate"),
+        (None, "must configure a test quality gate"),
+    ],
+)
+def test_test_execute_blocks_without_a_configured_test_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gates: object, message: str
+) -> None:
+    """A repository with no test gate must block rather than report an empty pass."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, gates)  # type: ignore[arg-type]
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:3",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "missing",
+        },
+    )
+
+    assert testing.run_test_execute("owner/repo:alert:3") == 1
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert message in report["error"]
+
+
+def test_test_execute_blocks_unknown_repositories_and_mismatched_workspaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Repository metadata, not the upstream artifact, decides which checkout is tested."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    execution = {
+        "status": "implementation_applied",
+        "requested_item_id": "item",
+        "repository": "owner/other",
+        "workspace_path": str(workspace),
+        "branch": "main",
+    }
+    _write_execution(state_dir, execution)
+    assert testing.run_test_execute("item") == 1
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert "not configured for execution" in report["error"]
+
+    execution.update({"repository": "owner/repo", "workspace_path": "/projects/elsewhere"})
+    _write_execution(state_dir, execution)
+    assert testing.run_test_execute("item") == 1
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert "workspace does not match" in report["error"]
+
+
+def test_checkout_rejects_unusable_pull_request_urls_and_branches(tmp_path: Path) -> None:
+    """Neither Git refspecs nor branch names may be assembled from unvalidated artifact fields."""
+    for url in (None, "https://github.com/owner/repo/pull/seven", "file:///etc/passwd"):
+        with pytest.raises(RuntimeError, match="pull request URL"):
+            testing._pull_request_number(url, "owner/repo")
+    assert testing._pull_request_number("https://github.com/owner/repo/pull/53/", "owner/repo") == (
+        "53"
+    )
+
+    for branch in (None, ""):
+        with pytest.raises(RuntimeError, match="does not record a branch"):
+            testing._checkout_branch(tmp_path, tmp_path, branch)
+
+
+def test_checkout_branch_requires_the_checkout_to_still_be_on_that_branch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Uncommitted engineer work is only trustworthy while the checkout still holds it."""
+    monkeypatch.setattr(testing, "_git_output", lambda *_args: "main")
+    with pytest.raises(RuntimeError, match="must still be on engineer branch feature"):
+        testing._checkout_branch(tmp_path, tmp_path, "feature")
+
+
+def test_worktree_path_is_contained_and_flattened(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worktree directory name comes from a sanitized slug, never from raw artifact text."""
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "/projects")
+    assert testing._worktree_path("Owner/Repo", "run-1") == Path(
+        "/projects/.repo-agent-worktrees/owner-repo/run-1"
+    )
+    with pytest.raises(RuntimeError, match="worktree directory"):
+        testing._worktree_path("../../", "run-1")
+    monkeypatch.setenv("ENGINEER_REPOSITORY_ROOT", "projects")
+    with pytest.raises(RuntimeError, match="absolute path"):
+        testing._worktree_path("owner/repo", "run-1")
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("TOTAL   902   51   340   53   92%\n", [92.0]),
+        ("Required test coverage reached. Total coverage: 91.63%\n", []),
+        ("statements covered: 84.5 %\n", []),
+        ("TOTAL  1 2 100%\nTOTAL  3 4 12%\n", [12.0, 100.0]),
+        ("no numbers here\n", []),
+    ],
+)
+def test_parse_coverage_anchors_to_total_lines_only(output: str, expected: list[float]) -> None:
+    """Only an anchored TOTAL row counts; a loose percentage elsewhere is not a coverage total."""
+    assert testing._parse_coverage(output) == expected
+
+
+def test_record_coverage_refuses_conflicting_totals_from_gate_output(tmp_path: Path) -> None:
+    """A gate printing two totals is refused outright rather than resolved in its favour."""
+    result: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(result, "Total coverage: 100%\nTOTAL  100  88  12%\n", tmp_path, 90)
+    assert result["coverage_percent"] == 12.0
+    assert result["status"] == "failed"
+
+    conflicting: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(conflicting, "TOTAL 1 2 99%\nTOTAL 3 4 11%\n", tmp_path, 90)
+    assert conflicting["status"] == "failed"
+    assert "conflicting totals" in str(conflicting["error"])
+    assert conflicting["coverage_percent"] is None
+
+
+def test_record_coverage_prefers_a_machine_readable_report_over_stdout(tmp_path: Path) -> None:
+    """The operator's backstop must not read the same stream the tool gate already trusted."""
+    (tmp_path / "coverage.json").write_text(
+        json.dumps({"totals": {"percent_covered": 42.5}}), encoding="utf-8"
+    )
+    result: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(result, "TOTAL   1   2   99%\n", tmp_path, 90)
+    assert result["coverage_percent"] == 42.5
+    assert result["coverage_source"] == "coverage.json"
+    assert result["status"] == "failed"
+    assert "below the configured minimum" in str(result["error"])
+
+
+def test_coverage_from_file_reads_both_report_formats_and_ignores_junk(tmp_path: Path) -> None:
+    """An unreadable, oversized, or malformed report is absent evidence, not a total."""
+    assert testing._coverage_from_file(tmp_path / "missing.json") is None
+
+    report = tmp_path / "coverage.json"
+    report.write_text("{not json", encoding="utf-8")
+    assert testing._coverage_from_file(report) is None
+    report.write_text(json.dumps({"totals": {"percent_covered": True}}), encoding="utf-8")
+    assert testing._coverage_from_file(report) is None
+    report.write_text(json.dumps({"totals": "nope"}), encoding="utf-8")
+    assert testing._coverage_from_file(report) is None
+    report.write_text(json.dumps({"totals": {"percent_covered": 88}}), encoding="utf-8")
+    assert testing._coverage_from_file(report) == 88.0
+
+    cobertura = tmp_path / "coverage.xml"
+    cobertura.write_text('<coverage line-rate="0.9163" branch-rate="0.8">', encoding="utf-8")
+    assert testing._coverage_from_file(cobertura) == 91.63
+    cobertura.write_text('<coverage branch-rate="0.8">', encoding="utf-8")
+    assert testing._coverage_from_file(cobertura) is None
+
+    monkeypatched = tmp_path / "huge.json"
+    monkeypatched.write_text("x" * 64, encoding="utf-8")
+    original = testing._COVERAGE_FILE_LIMIT
+    try:
+        testing._COVERAGE_FILE_LIMIT = 8
+        assert testing._coverage_from_file(monkeypatched) is None
+    finally:
+        testing._COVERAGE_FILE_LIMIT = original
+
+
+def test_record_coverage_fails_below_or_without_a_readable_minimum(tmp_path: Path) -> None:
+    """A coverage minimum that is unmet or unreadable is a failure, never an implicit pass."""
+    below: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(below, "TOTAL  1  2  71.20%", tmp_path, 90)
+    assert below["status"] == "failed"
+    assert "below the configured minimum" in str(below["error"])
+
+    unreadable: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(unreadable, "no percentage", tmp_path, 90)
+    assert unreadable["status"] == "failed"
+    assert unreadable["coverage_percent"] is None
+    assert unreadable["coverage_source"] == "unavailable"
+
+    unconfigured: dict[str, object] = {"status": "passed"}
+    testing._record_coverage(unconfigured, "TOTAL 1 2 12%", tmp_path, True)
+    assert unconfigured["status"] == "passed"
+    assert "minimum_coverage" not in unconfigured
+
+
+def test_run_gate_bounds_output_and_survives_bad_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gate that is missing, hanging, or not a command fails alone instead of raising."""
+    result, output = testing._run_gate("lint", "", tmp_path, 5)
+    assert result == {"gate": "lint", "status": "failed", "error": "lint gate is not a command"}
+    assert output == ""
+
+    def timeout(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutExpired(["make"], 5)
+
+    monkeypatch.setattr(testing, "run", timeout)
+    result, _ = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "failed"
+    assert "exceeded 5 seconds" in result["error"]
+
+    def missing(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("no such executable")
+
+    monkeypatch.setattr(testing, "run", missing)
+    result, _ = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "failed"
+    assert "no such executable" in result["error"]
+
+    monkeypatch.setattr(
+        testing,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="x" * 5_000, stderr=""),
+    )
+    result, output = testing._run_gate("test", "make test", tmp_path, 5)
+    assert result["status"] == "passed"
+    assert result["stdout"].startswith("...truncated...")
+    assert len(result["stdout"]) < len(output)
+
+
+def test_gate_environment_hides_repository_write_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operator-configured repository commands must never inherit a GitHub write token."""
+    monkeypatch.setenv("GH_TOKEN", "secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    environment = testing._gate_environment()
+    assert "GH_TOKEN" not in environment
+    assert "GITHUB_TOKEN" not in environment
+    assert environment["PATH"] == "/usr/bin"
+
+
+def test_gate_timeout_is_configurable_and_positive(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert testing._gate_timeout() == 1800
+    monkeypatch.setenv("TEST_GATE_TIMEOUT_SECONDS", "60")
+    assert testing._gate_timeout() == 60
+    monkeypatch.setenv("TEST_GATE_TIMEOUT_SECONDS", "0")
+    with pytest.raises(RuntimeError, match="TEST_GATE_TIMEOUT_SECONDS"):
+        testing._gate_timeout()
+
+
+def test_preflight_details_only_supplies_a_matching_ready_preflight(tmp_path: Path) -> None:
+    """A stale, blocked, or unrelated preflight may not supply criteria rendered into the report."""
+    assert testing._preflight_details(tmp_path, "item") == {}
+    path = tmp_path / "latest-engineer-preflight.json"
+    path.write_text(json.dumps(["not an object"]), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == {}
+    path.write_text(
+        json.dumps({"status": "blocked", "work_item": {"id": "item"}}), encoding="utf-8"
+    )
+    assert testing._preflight_details(tmp_path, "item") == {}
+    ready = {"status": "ready_for_coding", "work_item": {"id": "other"}}
+    path.write_text(json.dumps(ready), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == {}
+    ready["work_item"] = {"id": "item"}
+    path.write_text(json.dumps(ready), encoding="utf-8")
+    assert testing._preflight_details(tmp_path, "item") == ready
+
+
+def test_remove_worktree_falls_back_to_deleting_the_directory(tmp_path: Path) -> None:
+    """Teardown may not depend on Git succeeding; the disposable directory must always go."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "file.txt").write_text("x", encoding="utf-8")
+    assert testing._remove_worktree(tmp_path / "missing-workspace", worktree) is True
+    assert not worktree.exists()
+
+
+def test_test_markdown_omits_an_empty_acceptance_criteria_section() -> None:
+    """A report without criteria must not render an empty heading a reviewer would trust."""
+    rendered = testing._test_markdown(
+        {
+            "status": "passed",
+            "execution_path": "/state/latest-engineer-execution.json",
+            "requested_item_id": "item",
+            "checkout": {"source": "engineer_branch", "head_commit": "abc"},
+            "worktree_removed": True,
+            "gates": [{"gate": "test", "status": "passed", "exit_code": 0}],
+        }
+    )
+    assert "Acceptance criteria" not in rendered
+    assert "`test`: **passed** — exit code 0" in rendered
+
+
+def _engineer_working_changes(workspace: Path) -> None:
+    """Reproduce what engineer-execute leaves behind: edits, a deletion, and brand new files."""
+    (workspace / ".gitignore").write_text("*.log\nignored-dir/\n", encoding="utf-8")
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add ignore rules")
+    (workspace / "marker.txt").write_text("engineer-uncommitted\n", encoding="utf-8")
+    (workspace / "coverage.txt").unlink()
+    (workspace / "newpkg" / "sub").mkdir(parents=True)
+    (workspace / "newpkg" / "sub" / "mod.py").write_text("new module\n", encoding="utf-8")
+    (workspace / "newpkg" / "data.bin").write_bytes(bytes(range(256)))
+    (workspace / "debug.log").write_text("noise\n", encoding="utf-8")
+    (workspace / "ignored-dir").mkdir()
+    (workspace / "ignored-dir" / "junk.txt").write_text("noise\n", encoding="utf-8")
+    (workspace / "danglink").symlink_to("/etc/hosts")
+
+
+def _checkout_fingerprint(workspace: Path) -> dict[str, object]:
+    """Capture everything the test stage promises not to disturb, excluding Git's own metadata."""
+    contents: dict[str, str] = {}
+    for path in sorted(workspace.rglob("*")):
+        relative = path.relative_to(workspace)
+        if ".git" in relative.parts:
+            continue
+        if path.is_symlink():
+            contents[str(relative)] = f"symlink:{path.readlink()}"
+        elif path.is_file():
+            contents[str(relative)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            contents[str(relative)] = "directory"
+    return {
+        "contents": contents,
+        "status": _git_command(workspace, "status", "--porcelain", "--untracked-files=all"),
+        "index": _git_command(workspace, "ls-files", "--stage"),
+        "head": _git_command(workspace, "rev-parse", "HEAD"),
+        "branch": _git_command(workspace, "branch", "--show-current"),
+    }
+
+
+def test_test_execute_copies_new_untracked_files_into_the_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git diff HEAD` omits untracked files, so a new module must be copied in explicitly."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "cat newpkg/sub/mod.py", "lint": "cat marker.txt"},
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-3")
+    _engineer_working_changes(workspace)
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:4",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-3",
+        },
+    )
+    real_run_gates = testing._run_gates
+    observed: dict[str, object] = {}
+
+    def spy(gates: dict[str, object], worktree: Path) -> list[dict[str, object]]:
+        observed["files"] = sorted(
+            str(path.relative_to(worktree))
+            for path in worktree.rglob("*")
+            if path.is_file() and path.name != ".git"
+        )
+        blob = worktree / "newpkg" / "data.bin"
+        observed["binary"] = blob.read_bytes() if blob.is_file() else None
+        return real_run_gates(gates, worktree)
+
+    monkeypatch.setattr(testing, "_run_gates", spy)
+
+    assert testing.run_test_execute("owner/repo:alert:4") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed_partial"
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "new module\n"
+    assert gates["lint"]["stdout"] == "engineer-uncommitted\n"
+
+    checkout = report["checkout"]
+    assert checkout["untracked_files_copied"] == ["newpkg/data.bin", "newpkg/sub/mod.py"]
+    assert checkout["untracked_paths_skipped"] == ["danglink"]
+    assert observed["binary"] == bytes(range(256))
+    # The deleted file is gone, ignored paths never arrive, and the symlink is not followed.
+    assert observed["files"] == [
+        ".gitignore",
+        "marker.txt",
+        "newpkg/data.bin",
+        "newpkg/sub/mod.py",
+    ]
+    markdown = (state_dir / "latest-test-report.md").read_text(encoding="utf-8")
+    assert "New files tested: `newpkg/data.bin`, `newpkg/sub/mod.py`" in markdown
+    assert "Untracked paths not copied: `danglink`" in markdown
+
+
+def test_test_execute_leaves_the_configured_checkout_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Copying untracked files may not stage, stash, or otherwise disturb the real checkout."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-4")
+    _engineer_working_changes(workspace)
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": "owner/repo:alert:5",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": "repo-agent/engineer-4",
+        },
+    )
+    before = _checkout_fingerprint(workspace)
+
+    assert testing.run_test_execute("owner/repo:alert:5") == 0
+
+    assert _checkout_fingerprint(workspace) == before
+    assert "?? newpkg/" in str(before["status"])
+
+
+def test_worktree_destination_refuses_paths_that_escape_the_worktree(tmp_path: Path) -> None:
+    """A path from `ls-files` is still untrusted input to a filesystem write."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    assert testing._worktree_destination(worktree, "pkg/mod.py") == worktree / "pkg" / "mod.py"
+    for unsafe in ("/etc/passwd", "../escape.txt", "pkg/../../escape.txt", ".git/config"):
+        with pytest.raises(RuntimeError, match="unsafe to copy"):
+            testing._worktree_destination(worktree, unsafe)
+
+    (worktree / "link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    with pytest.raises(RuntimeError, match="resolves outside the worktree"):
+        testing._worktree_destination(worktree, "link/file.txt")
+
+
+def test_copy_untracked_skips_directories_and_reports_nothing_to_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An empty listing must not be mistaken for a failure, and non-files are never copied."""
+    monkeypatch.setattr(testing, "_git_capture", lambda *_args: b"")
+    assert testing._copy_untracked(tmp_path, tmp_path) == ([], [])
+
+    workspace = tmp_path / "workspace"
+    (workspace / "empty-dir").mkdir(parents=True)
+    monkeypatch.setattr(testing, "_git_capture", lambda *_args: b"empty-dir\0missing.txt\0")
+    assert testing._copy_untracked(workspace, tmp_path / "worktree") == (
+        [],
+        ["empty-dir", "missing.txt"],
+    )
+
+
+def _branch_execution(state_dir: Path, workspace: Path, branch: str, item: str) -> None:
+    _write_execution(
+        state_dir,
+        {
+            "status": "implementation_applied",
+            "requested_item_id": item,
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "branch": branch,
+        },
+    )
+
+
+def test_test_execute_preserves_trailing_whitespace_in_the_applied_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Stripping the diff would hide exactly the whitespace a format gate exists to catch."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch, tmp_path, {"test": "cat marker.txt", "format": "git diff --check"}
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-5")
+    (workspace / "marker.txt").write_text("engineer\ntrailing-ws-line   \n", encoding="utf-8")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-5", "owner/repo:alert:6")
+
+    assert testing.run_test_execute("owner/repo:alert:6") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "engineer\ntrailing-ws-line   \n"
+    assert gates["format"]["status"] == "failed"
+    assert report["status"] == "failed"
+
+
+def test_test_execute_applies_a_modified_tracked_binary_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`git diff --binary` terminates with a blank line, so the patch must not be stripped."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-6")
+    (workspace / "blob.bin").write_bytes(bytes(range(128)))
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add binary")
+    (workspace / "blob.bin").write_bytes(bytes(reversed(range(200))))
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-6", "owner/repo:alert:7")
+    real_run_gates = testing._run_gates
+    observed: dict[str, object] = {}
+
+    def spy(gates: dict[str, object], worktree: Path) -> list[dict[str, object]]:
+        blob = worktree / "blob.bin"
+        observed["bytes"] = blob.read_bytes() if blob.is_file() else None
+        return real_run_gates(gates, worktree)
+
+    monkeypatch.setattr(testing, "_run_gates", spy)
+
+    assert testing.run_test_execute("owner/repo:alert:7") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed_partial"
+    assert observed["bytes"] == bytes(reversed(range(200)))
+
+
+def test_test_execute_copies_untracked_names_with_leading_spaces(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`ls-files -z` output is byte-exact; stripping it loses the file and misreports the copy."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch, tmp_path, {"test": "cat ' leading.py'"}
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-7")
+    (workspace / " leading.py").write_text("leading space module\n", encoding="utf-8")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-7", "owner/repo:alert:8")
+
+    assert testing.run_test_execute("owner/repo:alert:8") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    checkout = report["checkout"]
+    assert checkout["untracked_files_copied"] == [" leading.py"]
+    assert checkout["untracked_paths_skipped"] == []
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["test"]["stdout"] == "leading space module\n"
+
+
+def test_test_execute_records_an_artifact_for_an_unparsable_gate_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stray quote in repo-info.yml must not leave the previous run's pointer standing."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "echo 'oops"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-8")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-8", "owner/repo:alert:9")
+    (state_dir / "latest-test-report.json").write_text(
+        json.dumps({"status": "passed", "requested_item_id": "an-earlier-item"}), encoding="utf-8"
+    )
+
+    assert testing.run_test_execute("owner/repo:alert:9") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["requested_item_id"] == "owner/repo:alert:9"
+    assert report["status"] == "failed"
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert "not a parsable command" in gates["test"]["error"]
+
+
+def test_test_execute_writes_its_artifact_even_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An interrupt still tears down the worktree; the artifact must record that it happened."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "true"})
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-9")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-9", "owner/repo:alert:10")
+
+    def interrupt(*_args: object, **_kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(testing, "_run_gates", interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        testing.run_test_execute("owner/repo:alert:10")
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "interrupted" in report["error"]
+    assert report["worktree_removed"] is True
+    assert not Path(report["worktree_path"]).exists()
+
+
+def test_test_execute_reads_coverage_from_the_report_file_not_gate_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gate that prints an inflated total cannot lift the operator's independent minimum."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {"test": "true", "coverage": "cat claimed.txt", "minimum_coverage": 90},
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-10")
+    (workspace / "claimed.txt").write_text(
+        "Total coverage: 100%\nTOTAL   100   88   100%\n", encoding="utf-8"
+    )
+    (workspace / "coverage.json").write_text(
+        json.dumps({"totals": {"percent_covered": 12.0}}), encoding="utf-8"
+    )
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add coverage evidence")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-10", "owner/repo:alert:11")
+
+    assert testing.run_test_execute("owner/repo:alert:11") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    gates = {gate["gate"]: gate for gate in report["gates"]}
+    assert gates["coverage"]["coverage_source"] == "coverage.json"
+    assert gates["coverage"]["coverage_percent"] == 12.0
+    assert gates["coverage"]["status"] == "failed"
+    assert report["status"] == "failed"
+
+
+def test_test_execute_reports_passed_only_when_every_gate_ran(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`passed` must mean the full gate set ran, not that the configured subset happened to pass."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {
+            "bootstrap": "true",
+            "format": "true",
+            "lint": "true",
+            "test": "true",
+            "coverage": "true",
+            "security": "true",
+            "minimum_coverage": 90,
+        },
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-11")
+    (workspace / "coverage.json").write_text(
+        json.dumps({"totals": {"percent_covered": 95.0}}), encoding="utf-8"
+    )
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add coverage report")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-11", "owner/repo:alert:12")
+
+    assert testing.run_test_execute("owner/repo:alert:12") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed"
+    assert [gate["status"] for gate in report["gates"]] == ["passed"] * 6
+
+
+def test_test_execute_blocks_a_pull_request_url_from_another_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A foreign URL must not be labelled onto a fetch that targets the configured remote."""
+    workspace, state_dir = _testing_environment(monkeypatch, tmp_path, {"test": "cat marker.txt"})
+    _git_command(workspace, "switch", "-c", "pull-source")
+    (workspace / "marker.txt").write_text("pull-request-head\n", encoding="utf-8")
+    _git_command(workspace, "commit", "-am", "pull request change")
+    _git_command(workspace, "push", str(tmp_path / "origin.git"), "HEAD:refs/pull/7/head")
+    _git_command(workspace, "switch", "main")
+    _git_command(workspace, "branch", "-D", "pull-source")
+    _write_execution(
+        state_dir,
+        {
+            "status": "existing_pull_request_ready_for_testing",
+            "requested_item_id": "owner/repo:pr:7",
+            "repository": "owner/repo",
+            "workspace_path": str(workspace),
+            "pull_request_url": "https://github.com/other-owner/other-repo/pull/7",
+        },
+    )
+
+    assert testing.run_test_execute("owner/repo:pr:7") == 1
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "blocked"
+    assert "does not belong to the configured repository owner/repo" in report["error"]
+
+
+def test_test_markdown_warns_when_the_disposable_worktree_survived(tmp_path: Path) -> None:
+    """A leaked worktree still holds the code under test, so it cannot be a silent field."""
+    rendered = testing._test_markdown(
+        {
+            "status": "passed",
+            "execution_path": "/state/latest-engineer-execution.json",
+            "requested_item_id": "item",
+            "checkout": {"source": "engineer_branch", "head_commit": "abc"},
+            "worktree_removed": False,
+            "worktree_path": str(tmp_path / "leaked"),
+            "gates": [{"gate": "test", "status": "passed", "exit_code": 0}],
+        }
+    )
+    assert "could not be removed" in rendered
+    assert "needs operator cleanup" in rendered
+
+
+def test_git_capture_returns_bytes_and_wraps_failures(tmp_path: Path) -> None:
+    """The byte-exact reader must fail as loudly as the scalar one, without decoding stdout."""
+    _git_command(tmp_path, "init", "-q", "-b", "main")
+    assert testing._git_capture(tmp_path, ["status", "--porcelain"]) == b""
+    with pytest.raises(RuntimeError, match="git rev-parse --verify failed"):
+        testing._git_capture(tmp_path, ["rev-parse", "--verify", "missing-ref"])
+
+
+def test_copy_untracked_handles_a_listing_without_a_trailing_separator(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a trailing empty element is discarded, never a real leading-space path."""
+    monkeypatch.setattr(testing, "_git_capture", lambda *_args: b"absent.py")
+    assert testing._copy_untracked(tmp_path, tmp_path) == ([], ["absent.py"])
