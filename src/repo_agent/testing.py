@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -332,10 +333,10 @@ def _overall_status(results: list[dict[str, Any]]) -> str:
 def _remove_worktree(workspace: Path, worktree: Path) -> bool:
     """Remove the disposable worktree unconditionally without masking the gate results."""
     for arguments in (["worktree", "remove", "--force", str(worktree)], ["worktree", "prune"]):
-        try:
+        # Git's exit status is not the authority here: the filesystem check below decides, and the
+        # rmtree fallback plus the returned bool report the real outcome to the operator.
+        with contextlib.suppress(OSError, RuntimeError):
             _git_output(workspace, arguments)
-        except (OSError, RuntimeError):
-            pass
     if worktree.exists():
         shutil.rmtree(worktree, ignore_errors=True)
     return not worktree.exists()
@@ -347,8 +348,10 @@ def _test_markdown(report: dict[str, Any]) -> str:
         "# Test execution report",
         "",
         f"- Status: **{report['status']}**",
-        "- Mode: disposable worktree only; nothing committed, pushed, published, merged, "
-        "or dismissed.",
+        (
+            "- Mode: disposable worktree only; nothing committed, pushed, published, merged, "
+            "or dismissed."
+        ),
         f"- Engineer execution: `{report['execution_path']}`",
         f"- Requested item: `{report['requested_item_id']}`",
     ]
