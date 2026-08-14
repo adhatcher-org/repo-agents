@@ -87,12 +87,15 @@ before redoing the work.
 1. **`college_planner#45`** — fix the five `set-state-in-effect` sites in `frontend/src/main.tsx`, or take
    the bump and disable the rule with a TODO. Option 1 is real React work; option 2 unblocks eight
    updates today without pretending the finding isn't there.
-2. **CodeQL default setup.** `financial_analysis` has *both* default and advanced setup enabled, so its
-   CodeQL fails every run (`analyses from advanced configurations cannot be processed when the default
-   setup is enabled`). Fix: `gh api -X PATCH repos/adhatcher-org/financial_analysis/code-scanning/default-setup -f state=not-configured`.
-   For `bourbonbook`, add a `codeql.yml` calling the shared workflow **first**, then disable default
-   setup — never the reverse, or scanning lapses. Once both emit canonical names,
-   `analyze / Analyze (python)` can join the required set org-wide.
+2. **Completed — CodeQL default setup.** Default setup is disabled for both `financial_analysis` and
+   `bourbonbook`. `financial_analysis` now passes its existing advanced Python workflow (run
+   [31840940985](https://github.com/adhatcher-org/financial_analysis/actions/runs/31840940985)).
+   Bourbon Book gained the shared advanced workflow in merged
+   [PR #60](https://github.com/adhatcher-org/bourbonbook/pull/60), preserving Actions,
+   JavaScript/TypeScript, and Python coverage; its main-branch advanced scan passed in
+   [run 31840775641](https://github.com/adhatcher-org/bourbonbook/actions/runs/31840775641).
+   Both now emit canonical advanced check names. Adding `analyze / Analyze (python)` to the
+   required set org-wide remains a separate follow-up.
 3. **`shared-workflows`** — `allow_auto_merge` is `false` and it has no self-check. It gates every other
    repo's CI, so it is the last repo that should auto-merge. Recommendation: leave auto-merge off, and
    treat "give it a real lint/validate gate" as its own piece of work.
