@@ -66,9 +66,31 @@ An empty check-run list must not read as green. A repo with no CI would return z
 
 | |patch|minor|major|
 |---|---|---|---|
-|direct:development (ruff, pytest)|merge|merge|merge|
+|direct:development (ruff, pytest)|merge|merge|**escalate**|
 |direct:production|merge|merge|escalate|
 |indirect|merge|merge|escalate|
+
+The matrix collapses to a single rule: **patch and minor merge, every major escalates**, regardless of
+dependency type. Flow A implements one severity comparison rather than a three-by-three lookup.
+
+The development-major cell was originally `merge`, on the reasoning that a broken dev tool cannot reach
+production. It was changed to `escalate` after the first grouped bump to reach CI proved otherwise —
+see below. A dev-tool major does not have to be *shipped* to be expensive; it only has to be *installed*,
+because it blocks every other update behind it.
+
+**Evidence — college_planner #42, 2026-08-14.** The first real grouped npm bump carried three development
+majors (`typescript` 5.7→7.0, `eslint` 9→10, `eslint-plugin-react-hooks` 5→7) plus patches. It failed
+`npm ci` in 17 seconds with `ERESOLVE`: `typescript-eslint@8.67.0` declares
+`peer typescript@">=4.8.4 <6.1.0"`, and TypeScript 7 is outside that range. Nothing was ever at risk —
+the required check caught it and the green-checks precondition meant Flow A would have escalated rather
+than merged either way. But the cell said `merge`, and under the original matrix that PR was nominally
+auto-merge-eligible on dependency type alone. Toolchain majors in particular (TypeScript, ESLint, the
+Python equivalents) tend to strand their whole plugin ecosystem on a peer range, so they are exactly the
+majors a human should see.
+
+Note the interaction with grouping: because a grouped PR is evaluated at its highest-severity member, one
+development major escalates the entire group. That is the intended behaviour and the reason the two
+decisions have to be read together.
 
 2. **Who merges** — **GitHub auto-merge.** The agent approves and enables auto-merge; GitHub performs the
    merge once required checks pass and the ruleset is satisfied. The agent never calls a direct merge.
