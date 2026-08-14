@@ -13,7 +13,7 @@ from urllib.request import Request
 
 import pytest
 
-from repo_agent import cli, engineering, planning, testing
+from repo_agent import cli, engineering, github, planning, testing
 
 
 class _Response:
@@ -1138,12 +1138,12 @@ def test_load_ready_preflight_requires_metadata_and_matching_workspace(
 
 def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        cli,
+        github,
         "run",
         lambda *_args, **_kwargs: SimpleNamespace(stdout='[{"number": 1}]\n[{"number": 2}]\n'),
     )
 
-    assert cli._gh_json(["api", "--paginate", "example"], {}) == [
+    assert github._gh_json(["api", "--paginate", "example"], {}) == [
         [{"number": 1}],
         [{"number": 2}],
     ]
@@ -1156,18 +1156,18 @@ def test_gh_json_decodes_paginated_responses(monkeypatch: pytest.MonkeyPatch) ->
 def test_gh_json_rejects_bad_output(
     monkeypatch: pytest.MonkeyPatch, stdout: str, message: str
 ) -> None:
-    monkeypatch.setattr(cli, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=stdout))
+    monkeypatch.setattr(github, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=stdout))
 
     with pytest.raises(RuntimeError, match=message):
-        cli._gh_json(["api", "example"], {})
+        github._gh_json(["api", "example"], {})
 
 
 def test_gh_json_reports_cli_error(monkeypatch: pytest.MonkeyPatch) -> None:
     error = CalledProcessError(1, ["gh"], output="fallback", stderr="denied")
-    monkeypatch.setattr(cli, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(github, "run", lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
 
     with pytest.raises(RuntimeError, match="denied"):
-        cli._gh_json(["api", "example"], {})
+        github._gh_json(["api", "example"], {})
 
 
 def test_github_environment_reads_token_without_logging_it(
@@ -1421,6 +1421,22 @@ def test_main_routes_itemless_commands_to_their_stage(
 
     assert called == [attribute]
     assert result.value.code == 3
+
+
+@pytest.mark.parametrize(("arguments", "apply"), [([], False), (["--apply"], True)])
+def test_main_routes_pr_triage_with_explicit_apply_flag(
+    monkeypatch: pytest.MonkeyPatch, arguments: list[str], apply: bool
+) -> None:
+    """Keep triage read-only until the operator explicitly enables its acting mode."""
+    monkeypatch.setattr("sys.argv", ["repo-agent", "pr-triage", *arguments])
+    received: list[bool] = []
+    monkeypatch.setattr(cli, "run_pr_triage", lambda *, apply: received.append(apply) or 0)
+
+    with pytest.raises(SystemExit) as result:
+        cli.main()
+
+    assert result.value.code == 0
+    assert received == [apply]
 
 
 @pytest.mark.parametrize(
