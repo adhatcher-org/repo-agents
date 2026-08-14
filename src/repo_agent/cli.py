@@ -10,7 +10,6 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from subprocess import CalledProcessError, run
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -22,8 +21,21 @@ from repo_agent.engineering import (
     run_engineer_preflight,
     run_team_lead_dispatch,
 )
+from repo_agent.github import _gh_json, _github_environment
 from repo_agent.planning import run_planning
 from repo_agent.testing import run_test_execute
+from repo_agent.triage import run_pr_triage
+
+
+_BASE_PULL_REQUEST_FIELDS = "number,title,author,headRefName,baseRefName,isDraft,reviewDecision,url"
+# Flow A needs merge state and check status to tell a conflicted pull request from a green one.
+# `mergeStateStatus` requires push access, which the read-only controller token may not carry, so
+# the wider selection is attempted first and the stage degrades rather than losing the inventory.
+_PULL_REQUEST_FIELD_SETS = (
+    ("full", f"{_BASE_PULL_REQUEST_FIELDS},mergeable,mergeStateStatus,statusCheckRollup"),
+    ("mergeable_only", f"{_BASE_PULL_REQUEST_FIELDS},mergeable,statusCheckRollup"),
+    ("base", _BASE_PULL_REQUEST_FIELDS),
+)
 
 
 def _ollama_tags_url(base_url: str) -> str:
@@ -119,55 +131,6 @@ def _load_config() -> dict[str, Any]:
     return payload
 
 
-def _github_environment() -> dict[str, str]:
-    """Read a GitHub token from a mounted secret file without logging it."""
-    token_file = Path(os.environ.get("GITHUB_TOKEN_FILE", "/run/secrets/github-token"))
-    try:
-        token = token_file.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError(
-            f"GitHub token file is unavailable: {token_file}. "
-            "Create it as a read-only mounted secret."
-        ) from exc
-    if not token:
-        raise RuntimeError(f"GitHub token file is empty: {token_file}")
-    environment = os.environ.copy()
-    environment["GH_TOKEN"] = token
-    return environment
-
-
-def _gh_json(arguments: list[str], environment: dict[str, str]) -> Any:
-    """Call GitHub CLI and decode a JSON response without exposing tokens."""
-    try:
-        completed = run(
-            ["gh", *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-    except CalledProcessError as exc:
-        message = exc.stderr.strip() or exc.stdout.strip() or "unknown gh failure"
-        raise RuntimeError(message) from exc
-    decoder = json.JSONDecoder()
-    position = 0
-    values: list[Any] = []
-    output = completed.stdout
-    while position < len(output):
-        while position < len(output) and output[position].isspace():
-            position += 1
-        if position == len(output):
-            break
-        try:
-            value, position = decoder.raw_decode(output, position)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("GitHub CLI returned invalid JSON") from exc
-        values.append(value)
-    if not values:
-        raise RuntimeError("GitHub CLI returned an empty response")
-    return values[0] if len(values) == 1 else values
-
-
 def _optional_alerts(repository: str, endpoint: str, environment: dict[str, str]) -> dict[str, Any]:
     """Report a security-alert class as unavailable when GitHub denies access."""
     try:
@@ -189,6 +152,7 @@ def _optional_alerts(repository: str, endpoint: str, environment: dict[str, str]
 
 
 def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[str, Any]:
+    """Collect one repository's open pull requests and alerts without changing anything."""
     pull_requests = _gh_json(
         [
             "pr",
@@ -200,7 +164,7 @@ def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[
             "--limit",
             "100",
             "--json",
-            "number,title,author,headRefName,baseRefName,isDraft,reviewDecision,url",
+            _PULL_REQUEST_FIELDS,
         ],
         environment,
     )
