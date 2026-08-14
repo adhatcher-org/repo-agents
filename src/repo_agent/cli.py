@@ -26,7 +26,6 @@ from repo_agent.planning import run_planning
 from repo_agent.testing import run_test_execute
 from repo_agent.triage import run_pr_triage
 
-
 _BASE_PULL_REQUEST_FIELDS = "number,title,author,headRefName,baseRefName,isDraft,reviewDecision,url"
 # Flow A needs merge state and check status to tell a conflicted pull request from a green one.
 # `mergeStateStatus` requires push access, which the read-only controller token may not carry, so
@@ -153,23 +152,38 @@ def _optional_alerts(repository: str, endpoint: str, environment: dict[str, str]
 
 def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[str, Any]:
     """Collect one repository's open pull requests and alerts without changing anything."""
-    pull_requests = _gh_json(
-        [
-            "pr",
-            "list",
-            "--repo",
-            repository,
-            "--state",
-            "open",
-            "--limit",
-            "100",
-            "--json",
-            _PULL_REQUEST_FIELDS,
-        ],
-        environment,
-    )
-    if not isinstance(pull_requests, list):
-        raise RuntimeError("GitHub CLI returned an unexpected pull-request response")
+    pull_requests: list[dict[str, Any]] | None = None
+    last_error: RuntimeError | None = None
+    for _name, fields in _PULL_REQUEST_FIELD_SETS:
+        try:
+            response = _gh_json(
+                [
+                    "pr",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--state",
+                    "open",
+                    "--limit",
+                    "100",
+                    "--json",
+                    fields,
+                ],
+                environment,
+            )
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(response, list):
+            raise RuntimeError("GitHub CLI returned an unexpected pull-request response")
+        if not all(isinstance(pull_request, dict) for pull_request in response):
+            raise RuntimeError("GitHub CLI returned an unexpected pull-request response")
+        pull_requests = response
+        break
+    if pull_requests is None:
+        raise RuntimeError(
+            f"GitHub CLI could not list pull requests for {repository}: {last_error}"
+        )
     return {
         "repository": repository,
         "open_pull_requests": {"count": len(pull_requests), "items": pull_requests},
@@ -378,12 +392,18 @@ def main() -> None:
             "engineer-execute",
             "health",
             "plan-once",
+            "pr-triage",
             "run-once",
             "test-execute",
             "version",
         ),
     )
     parser.add_argument("--item", help="exact approved work-item ID for an item-scoped stage")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="allow the pr-triage stage to approve, enable auto-merge, or comment",
+    )
     args = parser.parse_args()
 
     if args.command == "version":
@@ -396,6 +416,8 @@ def main() -> None:
         sys.exit(run_inventory())
     if args.command == "plan-once":
         sys.exit(run_planning())
+    if args.command == "pr-triage":
+        sys.exit(run_pr_triage(apply=args.apply))
     if args.command == "dispatch-once":
         sys.exit(run_team_lead_dispatch())
     if args.command == "engineer-handoff":

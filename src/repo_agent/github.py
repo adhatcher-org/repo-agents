@@ -1,4 +1,4 @@
-"""Reach GitHub through the `gh` CLI only, with the token read from a mounted file and never logged."""
+"""Reach GitHub through `gh`, reading a mounted token without logging it."""
 
 from __future__ import annotations
 

@@ -233,10 +233,12 @@ def _dependency_updates(message: object) -> list[dict[str, str]]:
 
 
 def _highest_severity(entries: list[dict[str, str]]) -> int:
-    """Evaluate a grouped update at its most severe member so one major escalates the whole group."""
+    """Evaluate a grouped update at its most severe member so one major escalates it."""
     return max(
-        (_UPDATE_TYPE_SEVERITY.get(entry.get("update-type", ""), _UNRECOGNISED_SEVERITY)
-         for entry in entries),
+        (
+            _UPDATE_TYPE_SEVERITY.get(entry.get("update-type", ""), _UNRECOGNISED_SEVERITY)
+            for entry in entries
+        ),
         default=_UNRECOGNISED_SEVERITY,
     )
 
@@ -262,7 +264,7 @@ def _required_check_config(value: object) -> list[dict[str, Any]]:
 
 
 def _triage_policy(repository: str) -> dict[str, Any]:
-    """Apply the org-wide defaults unless this repository overrides them; never guess on bad input."""
+    """Apply org-wide defaults unless this repository overrides them; reject bad input."""
     policy: dict[str, Any] = {
         "required_checks": [dict(check) for check in _DEFAULT_REQUIRED_CHECKS],
         "merge_method": _DEFAULT_MERGE_METHOD,
@@ -330,11 +332,15 @@ def _commit_nodes(pull_request: dict[str, Any], key: str) -> list[dict[str, Any]
     nodes = connection.get("nodes") if isinstance(connection, dict) else None
     if not isinstance(nodes, list):
         return []
-    return [node["commit"] for node in nodes if isinstance(node, dict) and isinstance(node.get("commit"), dict)]
+    return [
+        node["commit"]
+        for node in nodes
+        if isinstance(node, dict) and isinstance(node.get("commit"), dict)
+    ]
 
 
 def _author_check(pull_request: dict[str, Any]) -> tuple[bool, str]:
-    """Accept only a Dependabot-authored pull request whose every commit is Dependabot's and signed."""
+    """Accept only Dependabot-authored pull requests with signed Dependabot commits."""
     author = pull_request.get("author")
     login = _normalized_login(author.get("login") if isinstance(author, dict) else None)
     if login != _DEPENDABOT_LOGIN:
@@ -365,7 +371,7 @@ def _author_check(pull_request: dict[str, Any]) -> tuple[bool, str]:
 
 
 def _rollup_contexts(pull_request: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
-    """Read the head commit's check contexts; an unreadable rollup yields no contexts, not a pass."""
+    """Read head check contexts; an unreadable rollup yields no contexts, not a pass."""
     commits = _commit_nodes(pull_request, "headCommit")
     if not commits:
         return [], False
@@ -660,7 +666,9 @@ def _history_for(summary: dict[str, Any], history: dict[str, dict[str, Any]]) ->
     return {"rebase_attempts": entry.get("rebase_attempts", 0)}
 
 
-def _mutate(document: str, variables: dict[str, str], environment: dict[str, str]) -> dict[str, Any]:
+def _mutate(
+    document: str, variables: dict[str, str], environment: dict[str, str]
+) -> dict[str, Any]:
     """Run one GitHub mutation, reporting failure as data so one refusal cannot stop the stage."""
     try:
         _graphql(document, variables, environment)
@@ -679,7 +687,9 @@ def _act(
     node_id = summary.get("node_id")
     head_oid = summary.get("head_oid")
     if not isinstance(node_id, str) or not _NODE_ID.match(node_id):
-        return [{"action": "abort", "performed": False, "error": "pull request node id is unusable"}]
+        return [
+            {"action": "abort", "performed": False, "error": "pull request node id is unusable"}
+        ]
     if not isinstance(head_oid, str) or not _OBJECT_ID.match(head_oid):
         return [{"action": "abort", "performed": False, "error": "head commit id is unusable"}]
     if decision["route"] == _ROUTE_COMMENT:
@@ -708,7 +718,9 @@ def _act(
     return actions
 
 
-def _escalation(summary: dict[str, Any], decision: dict[str, Any], raised_at: str) -> dict[str, Any]:
+def _escalation(
+    summary: dict[str, Any], decision: dict[str, Any], raised_at: str
+) -> dict[str, Any]:
     """Record an escalation as artifact data; delivery is best effort and never gates the record."""
     return {
         "repository": summary["repository"],
@@ -727,7 +739,10 @@ def _telegram_configuration() -> dict[str, Any]:
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     token_file = os.environ.get("TELEGRAM_BOT_TOKEN_FILE", "").strip()
     if not chat_id or not token_file:
-        return {"configured": False, "reason": "TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN_FILE is unset"}
+        return {
+            "configured": False,
+            "reason": "TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN_FILE is unset",
+        }
     try:
         token = Path(token_file).read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -772,7 +787,7 @@ def _send_telegram(configuration: dict[str, Any], text: str, timeout: int) -> di
 
 
 def _notify(escalations: list[dict[str, Any]], apply: bool) -> dict[str, Any]:
-    """Notify best effort; a delivery failure downgrades the report, never the recorded escalation."""
+    """Notify best effort; delivery failure never removes the recorded escalation."""
     if not escalations:
         return {"channel": "telegram", "status": "nothing_to_notify", "sent": 0, "failed": 0}
     if not apply:
@@ -798,7 +813,13 @@ def _notify(escalations: list[dict[str, Any]], apply: bool) -> dict[str, Any]:
             os.environ.get("TELEGRAM_TIMEOUT_SECONDS", "10"), "TELEGRAM_TIMEOUT_SECONDS"
         )
     except RuntimeError as exc:
-        return {"channel": "telegram", "status": "failed", "sent": 0, "failed": 0, "reason": str(exc)}
+        return {
+            "channel": "telegram",
+            "status": "failed",
+            "sent": 0,
+            "failed": 0,
+            "reason": str(exc),
+        }
     sent = 0
     failures: list[str] = []
     for escalation in escalations[:_MAX_NOTIFICATIONS]:
@@ -829,7 +850,7 @@ def _triage_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Status: **{report['status']}**",
         f"- Mode: **{report['mode']}**",
-        "- Scope: GitHub API and policy only; no clone, no model, no gate execution, no merge call.",
+        "- Scope: GitHub API and policy only; no clone, model, gate execution, or merge call.",
         f"- Inventory: `{report['inventory_path']}`",
     ]
     if report.get("error"):
@@ -856,7 +877,10 @@ def _triage_markdown(report: dict[str, Any]) -> str:
     lines.extend(["", "## Escalations", ""])
     if escalations:
         lines.extend(
-            f"- `{item['repository']}#{item['pull_request']}` **{item['reason']}** — {item['summary']}"
+            (
+                f"- `{item['repository']}#{item['pull_request']}` "
+                f"**{item['reason']}** — {item['summary']}"
+            )
             for item in escalations
         )
     else:
@@ -867,9 +891,11 @@ def _triage_markdown(report: dict[str, Any]) -> str:
             "",
             "## Notifications",
             "",
-            f"- Channel `{notifications.get('channel', 'none')}`: "
-            f"**{notifications.get('status', 'unknown')}** "
-            f"(sent {notifications.get('sent', 0)}, failed {notifications.get('failed', 0)})",
+            (
+                f"- Channel `{notifications.get('channel', 'none')}`: "
+                f"**{notifications.get('status', 'unknown')}** "
+                f"(sent {notifications.get('sent', 0)}, failed {notifications.get('failed', 0)})"
+            ),
         ]
     )
     if notifications.get("reason"):
@@ -917,7 +943,7 @@ def _persist_report(report: dict[str, Any], state_dir: Path, timestamp: datetime
 
 
 def _inventory_repositories(inventory_path: Path) -> list[str]:
-    """Take the repository list from the upstream artifact, re-validating rather than trusting it."""
+    """Read upstream repositories, re-validating instead of trusting the artifact."""
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     if not isinstance(inventory, dict):
         raise RuntimeError("latest inventory must be a JSON object")
@@ -962,9 +988,7 @@ def _triage_repository(
                 _ROUTE_ESCALATE, "repository_archived", "The repository is archived."
             )
         else:
-            decision = _route_pull_request(
-                pull_request, facts, policy, entry, now, pending_hours
-            )
+            decision = _route_pull_request(pull_request, facts, policy, entry, now, pending_hours)
         attempts = entry["rebase_attempts"]
         actions: list[dict[str, Any]] = []
         if decision["route"] in {_ROUTE_APPROVE, _ROUTE_COMMENT}:
@@ -1015,7 +1039,9 @@ def run_pr_triage(apply: bool = False) -> int:
         history = _previous_history(state_dir)
         pending_hours = _pending_hours()
         environment = _github_environment(
-            "PR_TRIAGE_TOKEN_FILE" if os.environ.get("PR_TRIAGE_TOKEN_FILE") else "GITHUB_TOKEN_FILE"
+            "PR_TRIAGE_TOKEN_FILE"
+            if os.environ.get("PR_TRIAGE_TOKEN_FILE")
+            else "GITHUB_TOKEN_FILE"
         )
         entries: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
