@@ -29,11 +29,11 @@ from repo_agent.triage import run_pr_triage
 _BASE_PULL_REQUEST_FIELDS = "number,title,author,headRefName,baseRefName,isDraft,reviewDecision,url"
 # Flow A needs merge state and check status to tell a conflicted pull request from a green one.
 # `mergeStateStatus` requires push access, which the read-only controller token may not carry, so
-# the wider selection is attempted first and the stage degrades rather than losing the inventory.
+# the wider selection is attempted first. Every accepted inventory response includes check rollup.
+# Flow A independently reads authoritative state with its dedicated token before acting.
 _PULL_REQUEST_FIELD_SETS = (
     ("full", f"{_BASE_PULL_REQUEST_FIELDS},mergeable,mergeStateStatus,statusCheckRollup"),
     ("mergeable_only", f"{_BASE_PULL_REQUEST_FIELDS},mergeable,statusCheckRollup"),
-    ("base", _BASE_PULL_REQUEST_FIELDS),
 )
 
 
@@ -154,7 +154,8 @@ def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[
     """Collect one repository's open pull requests and alerts without changing anything."""
     pull_requests: list[dict[str, Any]] | None = None
     last_error: RuntimeError | None = None
-    for _name, fields in _PULL_REQUEST_FIELD_SETS:
+    field_set: str | None = None
+    for name, fields in _PULL_REQUEST_FIELD_SETS:
         try:
             response = _gh_json(
                 [
@@ -179,6 +180,7 @@ def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[
         if not all(isinstance(pull_request, dict) for pull_request in response):
             raise RuntimeError("GitHub CLI returned an unexpected pull-request response")
         pull_requests = response
+        field_set = name
         break
     if pull_requests is None:
         raise RuntimeError(
@@ -186,7 +188,11 @@ def _inventory_repository(repository: str, environment: dict[str, str]) -> dict[
         )
     return {
         "repository": repository,
-        "open_pull_requests": {"count": len(pull_requests), "items": pull_requests},
+        "open_pull_requests": {
+            "count": len(pull_requests),
+            "items": pull_requests,
+            "field_set": field_set,
+        },
         "dependabot": _optional_alerts(repository, "dependabot/alerts", environment),
         "code_scanning": _optional_alerts(repository, "code-scanning/alerts", environment),
         "secret_scanning": _optional_alerts(repository, "secret-scanning/alerts", environment),

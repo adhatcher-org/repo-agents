@@ -294,6 +294,29 @@ def test_route_pull_request_covers_checks_stalled_and_merge_capability() -> None
     )
 
 
+def test_route_pull_request_escalates_a_group_when_any_member_is_major() -> None:
+    message = (
+        "updated-dependencies:\n"
+        "- dependency-name: requests\n"
+        "  update-type: version-update:semver-patch\n"
+        "  dependency-group: python-dependencies\n"
+        "- dependency-name: django\n"
+        "  update-type: version-update:semver-major\n"
+        "  dependency-group: python-dependencies"
+    )
+    decision = triage._route_pull_request(
+        _pull_request(prCommits={"totalCount": 1, "nodes": [{"commit": _commit(message)}]}),
+        _facts(),
+        _policy(),
+        {},
+        NOW,
+        24,
+    )
+    assert decision["route"] == triage._ROUTE_ESCALATE
+    assert decision["reason"] == "update_outside_policy"
+    assert decision["evidence"]["severity"] == "major"
+
+
 def test_rollup_check_state_and_head_age() -> None:
     contexts, truncated = triage._rollup_contexts(_pull_request())
     assert (
@@ -320,7 +343,7 @@ def test_history_summary_mutations_and_actions(
         triage, "_graphql", lambda _doc, variables, _env: calls.append(variables) or {}
     )
     actions = triage._act({"route": triage._ROUTE_APPROVE}, summary, _policy(), {})
-    assert [item["action"] for item in actions] == ["enable_auto_merge", "approve"]
+    assert [item["action"] for item in actions] == ["approve", "enable_auto_merge"]
     assert len(calls) == 2
     assert (
         triage._act({"route": triage._ROUTE_COMMENT}, summary, _policy(), {})[0]["action"]
@@ -368,14 +391,32 @@ def test_inventory_triage_repository_and_run(
         "mergeCommitAllowed": True,
         "rebaseMergeAllowed": True,
         "defaultBranchRef": {"name": "main"},
-        "pullRequests": {"nodes": [_pull_request()]},
+        "pullRequests": {"totalCount": 1, "nodes": [_pull_request()]},
     }
     monkeypatch.setattr(triage, "_fetch_repository", lambda *_: node)
     monkeypatch.setattr(triage, "_triage_policy", lambda *_: _policy())
     results = triage._triage_repository("acme/repo", {}, {}, NOW, 24, False)
-    assert results[0]["actions"][0]["action"] == "would_enable_auto_merge_then_approve"
+    assert results[0]["actions"][0]["action"] == "would_approve_then_enable_auto_merge"
     monkeypatch.setenv("AGENT_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(triage, "_github_environment", lambda *_: {})
     assert triage.run_pr_triage() == 0
     report = json.loads((tmp_path / "latest-pr-triage.json").read_text(encoding="utf-8"))
     assert report["status"] == "passed"
+
+
+def test_triage_repository_rejects_a_truncated_pull_request_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = {
+        "isArchived": False,
+        "autoMergeAllowed": True,
+        "squashMergeAllowed": True,
+        "mergeCommitAllowed": True,
+        "rebaseMergeAllowed": True,
+        "defaultBranchRef": {"name": "main"},
+        "pullRequests": {"totalCount": 2, "nodes": [_pull_request()]},
+    }
+    monkeypatch.setattr(triage, "_fetch_repository", lambda *_: node)
+    monkeypatch.setattr(triage, "_triage_policy", lambda *_: _policy())
+    with pytest.raises(RuntimeError, match="every open pull request"):
+        triage._triage_repository("acme/repo", {}, {}, NOW, 24, False)

@@ -91,7 +91,7 @@ query($owner: String!, $name: String!) {
     mergeCommitAllowed
     rebaseMergeAllowed
     defaultBranchRef { name }
-    pullRequests(states: OPEN, first: 50, orderBy: {field: CREATED_AT, direction: ASC}) {
+    pullRequests(states: OPEN, first: 100, orderBy: {field: CREATED_AT, direction: ASC}) {
       totalCount
       nodes {
         id
@@ -695,8 +695,16 @@ def _act(
     if decision["route"] == _ROUTE_COMMENT:
         result = _mutate(_COMMENT_MUTATION, {"pullRequestId": node_id}, environment)
         return [{"action": "comment_dependabot_rebase", **result}]
-    # Auto-merge first: it carries the expected head commit, so a pull request that moved is
-    # refused before any approval is recorded against it.
+    # Approve the exact reviewed commit first. If the pull request changes before the next mutation,
+    # enable-auto-merge rejects its expected head OID and no changed head is auto-merged.
+    approved = _mutate(
+        _APPROVE_MUTATION,
+        {"pullRequestId": node_id, "commitOID": head_oid},
+        environment,
+    )
+    actions = [{"action": "approve", **approved}]
+    if not approved["performed"]:
+        return actions
     enabled = _mutate(
         _AUTO_MERGE_MUTATION,
         {
@@ -706,15 +714,7 @@ def _act(
         },
         environment,
     )
-    actions = [{"action": "enable_auto_merge", **enabled}]
-    if not enabled["performed"]:
-        return actions
-    approved = _mutate(
-        _APPROVE_MUTATION,
-        {"pullRequestId": node_id, "commitOID": head_oid},
-        environment,
-    )
-    actions.append({"action": "approve", **approved})
+    actions.append({"action": "enable_auto_merge", **enabled})
     return actions
 
 
@@ -977,8 +977,11 @@ def _triage_repository(
     facts = _repository_facts(repository, node)
     connection = node.get("pullRequests")
     nodes = connection.get("nodes") if isinstance(connection, dict) else None
+    total = connection.get("totalCount") if isinstance(connection, dict) else None
+    if not isinstance(nodes, list) or not isinstance(total, int) or total > len(nodes):
+        raise RuntimeError("GitHub did not return every open pull request for triage")
     results: list[dict[str, Any]] = []
-    for pull_request in nodes or []:
+    for pull_request in nodes:
         if not isinstance(pull_request, dict) or not isinstance(pull_request.get("number"), int):
             continue
         summary = _pull_request_summary(repository, pull_request)
@@ -1000,7 +1003,7 @@ def _triage_repository(
                 actions = [
                     {"action": "would_comment_dependabot_rebase", "performed": False}
                     if decision["route"] == _ROUTE_COMMENT
-                    else {"action": "would_enable_auto_merge_then_approve", "performed": False}
+                    else {"action": "would_approve_then_enable_auto_merge", "performed": False}
                 ]
         results.append(
             {

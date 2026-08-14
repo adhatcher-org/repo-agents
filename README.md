@@ -26,6 +26,7 @@ the pointer file *is* the interface, and every stage re-validates what it reads.
 | `engineer-preflight` | `latest-engineer-preflight.json` | engineer | no |
 | `engineer-execute` | `latest-engineer-execution.json` | engineer | branch + working tree |
 | `test-execute` | `latest-test-report.json` | engineer | disposable worktree only |
+| `pr-triage` | `latest-pr-triage.json` | dedicated future triage service | GitHub only with explicit `--apply` |
 
 Stages that produce operator-facing evidence also write a Markdown companion beside the JSON —
 `latest-team-lead-report.md`, `latest-architect-plan.md`, `latest-team-lead-dispatch.md`,
@@ -37,6 +38,53 @@ work-item ID matches the `--item` argument. Failures are never raised to the cal
 `status: "blocked"` with an error string, still writes its artifact, and exits 1.
 
 The PR-review, publish, and CI-monitor stages in `docs/remainingwork.md` are not implemented yet.
+
+## Flow A: deterministic pull-request triage
+
+`pr-triage` reads the latest successful inventory, then re-reads each repository's open pull requests
+from GitHub. It uses Dependabot's signed commit metadata, the live merge state, and the canonical
+`ci / Test and build` check from GitHub Actions app ID `15368`. It writes a timestamped
+`pr-triage.json`/`pr-triage.md`, `latest-pr-triage.json`/`latest-pr-triage.md`, and a separate
+`latest-escalations.json` record.
+
+The default is a dry run. It never clones a repository, calls a model, runs local gates, or directly
+merges a pull request. A patch or minor Dependabot update with the required check present and green is
+reported as eligible; every major, missing or failed CI, merge conflict, unknown dependency metadata,
+and non-Dependabot or agent-authored PR is escalated or reported without auto-merging. A grouped
+Dependabot PR is judged by its highest-severity member.
+
+```bash
+# Read-only: records decisions and would-be actions only.
+docker exec repo-agent repo-agent pr-triage
+
+# Reserved for the dedicated triage service after the authority design below is approved.
+# It may approve an exact head commit, enable GitHub auto-merge, and ask Dependabot to rebase.
+docker exec repo-agent-pr-triage repo-agent pr-triage --apply
+```
+
+`--apply` is deliberately not part of the controller's normal command. The existing controller has a
+read token and must not quietly gain write authority; the engineer service has broad repository write
+authority and must not be reused. Flow A needs a third, profile-only service and a separate GitHub App
+or fine-grained token limited to the configured repositories and the minimum pull-request review,
+auto-merge, and issue-comment permissions. It must have no repository-code mount and no direct-merge
+path. `compose.yml` intentionally does not define that service or mount its token until the precise
+GitHub permission model and deployment owner are approved.
+
+### Telegram escalations
+
+Escalations are always persisted in the artifact; Telegram delivery is best effort and never changes a
+triage decision. In dry-run mode the artifact reports how many notifications would be sent. In apply
+mode, configure the future triage service with:
+
+- `TELEGRAM_CHAT_ID`: the private chat, group, or channel ID that receives escalations.
+- `TELEGRAM_BOT_TOKEN_FILE`: an absolute path to a read-only mounted file containing only the bot token.
+- `TELEGRAM_TIMEOUT_SECONDS`: optional positive request timeout in seconds; defaults to `10`.
+
+For example, mount `/mnt/user/app_cache/repo-agent/secrets/telegram-bot-token` read-only at
+`/run/triage-secrets/telegram-bot-token`, set `TELEGRAM_BOT_TOKEN_FILE` to that container path, and
+set `TELEGRAM_CHAT_ID` in the service environment. Do not put the bot token in Compose, `.env`, an
+artifact, or logs. A delivered message identifies the repository, PR number, reason, title, summary,
+and URL; it uses Telegram plain text, so PR-controlled text is not interpreted as markup.
 
 ## Python dependency management
 
