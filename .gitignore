@@ -12,3 +12,4 @@ secrets/
 config/repos.yml
 config/repo-info.yml
 .coverage*
+*.code-workspace

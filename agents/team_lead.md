@@ -28,3 +28,4 @@ Read-only handoff authority only. It selects the first plan-order item with an e
 `approved`, or `remediate` disposition, and records the engineer handoff. It never runs the
 engineer, changes code, dismisses alerts, creates branches, opens pull requests, or merges code.
 It refuses to assign another item while `active-work-item.json` is nonterminal.
+Clean up any runs in data/runs that are more than 7 days old.
