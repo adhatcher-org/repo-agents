@@ -67,18 +67,22 @@ is new tooling reporting genuine pre-existing issues — suppressing it would hi
 Dependabot grouping applied per ecosystem, `claude-review` scoped away from bot PRs, rulesets applied.
 All step-1 PRs merged. Four of five repos are at zero open PRs.
 
-**In flight — step 2 (Flow A).** A background agent is implementing it on a feature branch. It was told
-to build the decision logic and artifact fully, keep the *acting* half (approve / enable auto-merge /
-comment) **off by default behind a flag**, and open a PR without merging. It was also asked to surface
-two things rather than decide them:
+**Done — step 2 (Flow A).** The deterministic, GitHub-API-only PR triage flow was merged in
+[PR #14](https://github.com/adhatcher-org/repo-agents/pull/14) at `2a22858` on 2026-08-14. It delivers
+the PR inventory with merge state and check rollup, deterministic artifacts and policy routing, safe
+handling of missing/failed CI, conflicts, majors, grouped updates, and agent-authored PRs, plus focused
+tests and review. Acting operations (approve, enable auto-merge, and Dependabot rebase comments) remain
+disabled unless `pr-triage --apply` is explicitly passed; there is no direct merge action.
 
-- **Which service runs Flow A, and with what token.** Flow A needs approve + enable-auto-merge + comment,
-  but *not* repo write and *not* merge — a third blast-radius tier that neither existing `compose.yml`
-  service has. The controller must not quietly gain a write token.
-- **Telegram config** — exact env vars, minimum setup, and what a delivered escalation looks like.
+Telegram is documented with `TELEGRAM_CHAT_ID`, `TELEGRAM_BOT_TOKEN_FILE`, and optional
+`TELEGRAM_TIMEOUT_SECONDS`; the recorded artifact remains authoritative and delivery is best effort.
+The dedicated Flow A service and its least-privilege token remain intentionally unresolved: it needs
+approve, auto-merge-enable, and comment authority, but neither repository write nor direct-merge
+authority. Do not give the controller a write token or reuse the engineer token without a separate
+design decision.
 
-If that PR is not open yet, the agent may still be running or may have died; check for a feature branch
-before redoing the work.
+[PR #15](https://github.com/adhatcher-org/repo-agents/pull/15) is a duplicate, conflicting follow-up
+branch and must not be resolved or reimplemented; its changes are superseded by merged PR #14.
 
 ## Open items
 
@@ -87,7 +91,13 @@ before redoing the work.
 1. **`college_planner#45`** — fix the five `set-state-in-effect` sites in `frontend/src/main.tsx`, or take
    the bump and disable the rule with a TODO. Option 1 is real React work; option 2 unblocks eight
    updates today without pretending the finding isn't there.
-2. **Completed — CodeQL default setup.** Default setup is disabled for both `financial_analysis` and
+2. **`shared-workflows`** — `allow_auto_merge` is `false` and it has no self-check. It gates every other
+   repo's CI, so it is the last repo that should auto-merge. Recommendation: leave auto-merge off, and
+   treat "give it a real lint/validate gate" as its own piece of work.
+
+**Completed since the original handoff**
+
+- **CodeQL default setup.** Default setup is disabled for both `financial_analysis` and
    `bourbonbook`. `financial_analysis` now passes its existing advanced Python workflow (run
    [31840940985](https://github.com/adhatcher-org/financial_analysis/actions/runs/31840940985)).
    Bourbon Book gained the shared advanced workflow in merged
@@ -96,13 +106,34 @@ before redoing the work.
    [run 31840775641](https://github.com/adhatcher-org/bourbonbook/actions/runs/31840775641).
    Both now emit canonical advanced check names. Adding `analyze / Analyze (python)` to the
    required set org-wide remains a separate follow-up.
-3. **`shared-workflows`** — `allow_auto_merge` is `false` and it has no self-check. It gates every other
-   repo's CI, so it is the last repo that should auto-merge. Recommendation: leave auto-merge off, and
-   treat "give it a real lint/validate gate" as its own piece of work.
-4. **Completed — bourbonbook's repo-level `CLAUDE_CODE_OAUTH_TOKEN` was deleted.** It had shadowed the
+
+- **Bourbon Book repo-level `CLAUDE_CODE_OAUTH_TOKEN` was deleted.** It had shadowed the
    org secret, meaning an org-token rotation could have left bourbonbook silently using the stale copy.
 
 **Queued work**
+
+- **Step 2.5 — CI-equivalent Makefile gates before any agent-created PR.** Before starting Flow B's
+  publisher, each managed repository needs a non-mutating `make check` target. It must run format
+  validation, linting, tests, coverage, and security, plus lock/dependency validation where that
+  project uses it. The publisher must require the matching successful local `make check` report before
+  it commits, pushes, or opens a PR; component-only results are not sufficient.
+
+  Audit completed locally on 2026-08-14; none of the following repositories fully meets the contract:
+
+  - `bourbonbook`: no `check` target. `pr-review` is close, but the CI-equivalent pre-PR gate needs a
+    stable `make check` entry point.
+  - `schwinn_stationary_bike`: no `check`, lint, or non-mutating format-check target. `local-test`
+    covers tests, coverage, security, and a Docker UI test only.
+  - `TNO-Portal`: no `check`, lint, format-check, or security target.
+  - `financial_analysis`: has `check`, but it omits format validation; its `format` target modifies
+    files and must not be used as a check.
+  - `college_planner`: no `check`; its existing `format` target modifies files, so a non-mutating
+    format-check must be added to the aggregate gate.
+  - `giftmatcher`: no Makefile.
+
+  Do not weaken a repository's GitHub CI while adding these targets. Retain its existing project-specific
+  checks (for example type checking, dependency audits, PR hygiene, or Docker/UI checks) when they are
+  already part of its CI contract.
 
 - **Step 1b — onboarding skill.** A skill that applies this configuration to a *new* repo. Its defining
   rule: **derive from what the repo already has.** Survey existing workflows and real check-run names,

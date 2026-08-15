@@ -22,7 +22,10 @@ from repo_agent.engineering import (
 )
 from repo_agent.planning import _positive_integer
 
-_GATE_ORDER = ("bootstrap", "format", "lint", "test", "coverage", "security")
+# `check` must run the repository's CI-equivalent aggregate command (normally `make check`).
+# The component gates remain useful evidence, but they are not a substitute for the exact command
+# CI will execute before a publisher is allowed to create a pull request.
+_GATE_ORDER = ("bootstrap", "format", "lint", "test", "coverage", "security", "check")
 _TESTABLE_STATUSES = frozenset(
     {"existing_pull_request_ready_for_testing", "implementation_applied"}
 )
@@ -322,12 +325,11 @@ def _run_gates(gates: dict[str, Any], worktree: Path) -> list[dict[str, Any]]:
 
 
 def _overall_status(results: list[dict[str, Any]]) -> str:
-    """Never let a bare `passed` mean that the gates which matter were not configured."""
+    """Reserve `passed` for a successful CI-equivalent aggregate check."""
     if any(gate["status"] == "failed" for gate in results):
         return "failed"
-    if any(gate["status"] == "skipped" for gate in results):
-        return "passed_partial"
-    return "passed"
+    check = next((gate for gate in results if gate["gate"] == "check"), None)
+    return "passed" if check and check["status"] == "passed" else "passed_partial"
 
 
 def _remove_worktree(workspace: Path, worktree: Path) -> bool:
