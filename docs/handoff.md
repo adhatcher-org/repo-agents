@@ -81,8 +81,36 @@ approve, auto-merge-enable, and comment authority, but neither repository write 
 authority. Do not give the controller a write token or reuse the engineer token without a separate
 design decision.
 
-[PR #15](https://github.com/adhatcher-org/repo-agents/pull/15) is a duplicate, conflicting follow-up
-branch and must not be resolved or reimplemented; its changes are superseded by merged PR #14.
+**In review — step 2.5, the repo-agent half.**
+[PR #17](https://github.com/adhatcher-org/repo-agents/pull/17) makes a `passed` test report mean the
+repository's CI-equivalent aggregate actually ran. `check` joins the gate order; `passed` is reserved for
+a run where that gate itself passed, and everything else that did not fail is `passed_partial`, which is
+explicitly not eligible for publication.
+
+This **inverts** the prior rule rather than extending it. Before, any skipped gate downgraded the run;
+now a passing `check` is the single positive signal, because the aggregate is what CI actually executes
+and the component gates are corroborating evidence rather than a substitute. `pr_reviewer` may no longer
+create a pull request without a matching `latest-test-report.json` at `status: passed` carrying a passing
+`check` for that exact repository, work item and tested commit. `test_agent` documents the new order and
+semantics, and `config/repo-info.example.yml` gains `check: make check`.
+
+The same PR removes a dead `_REBASE_COMMENT` constant in `triage.py` (reported by
+`github-code-quality` on #16). It was never read — the body is a literal inside `_COMMENT_MUTATION`'s
+GraphQL string — and it was deleted rather than wired up, so the comment body stays non-configurable and
+cannot be influenced by config or untrusted input.
+
+### Do not open pull requests from `agent/flow-a-pr-triage`
+
+That branch has now produced three: #14 (merged), [#15](https://github.com/adhatcher-org/repo-agents/pull/15)
+and [#16](https://github.com/adhatcher-org/repo-agents/pull/16), both closed as duplicates. **#14 was
+squash-merged**, so the branch's original commits look unmerged even though their content landed in
+`2a22858`. Merging `main` back in produces `add/add` conflicts on `triage.py`, `tests/test_triage.py` and
+`docs/handoff.md` — git treating main's squashed copies and the branch's originals as unrelated files.
+
+Do not resolve those conflicts; that is hand-merging already-merged content. If something genuinely new
+is on that branch, cherry-pick just that commit onto current `main`, which is how #17 was produced — it
+applied cleanly, confirming the new work was independent of the #14 content all along. **Deleting the
+branch would stop this recurring.**
 
 ## Open items
 
@@ -112,11 +140,14 @@ branch and must not be resolved or reimplemented; its changes are superseded by 
 
 **Queued work**
 
-- **Step 2.5 — CI-equivalent Makefile gates before any agent-created PR.** Before starting Flow B's
-  publisher, each managed repository needs a non-mutating `make check` target. It must run format
-  validation, linting, tests, coverage, and security, plus lock/dependency validation where that
-  project uses it. The publisher must require the matching successful local `make check` report before
-  it commits, pushes, or opens a PR; component-only results are not sufficient.
+- **Step 2.5 — the per-repository half.** The enforcement side is done in PR #17 above: `repo-agent` now
+  refuses to treat a report as `passed` without a passing `check` gate. What remains is giving each
+  managed repository the `make check` target that gate invokes. Until a repo has one, its runs report
+  `passed_partial` and are correctly ineligible for publication — the contract fails closed, so this is
+  not urgent, but Flow B's publisher is blocked on it.
+
+  Each target must be **non-mutating** and run format validation, linting, tests, coverage, and security,
+  plus lock/dependency validation where the project uses it.
 
   Audit completed locally on 2026-08-14; none of the following repositories fully meets the contract:
 
@@ -146,6 +177,21 @@ branch and must not be resolved or reimplemented; its changes are superseded by 
 - **Step 3 — Flow B.** CodeQL remediation, escalate-first per decision 3. Reuses existing machinery plus
   a publisher (push + open PR). Its output is a PR, which then appears to Flow A — which must watch it
   and never auto-merge it.
+
+**Local environment — blocks running `make check` here**
+
+`.venv` in this checkout is being corrupted repeatedly by a file-sync tool. `make check` fails with
+`ModuleNotFoundError: No module named 'repo_agent'` even though the editable-install `.pth` file exists
+and points at a valid path — `src` never reaches `sys.path`. The tell is duplicate files with numeric
+suffixes: `__editable__.repo_agent-0.1.0 2.pth`, `... 3.pth`, matching the `backend/.coverage 2` / `3`
+files seen in the college_planner checkout.
+
+Workaround is `rm -rf .venv && make install`. **This is not a one-off** — it recurred within minutes
+during the 2026-08-14 session, so the sync is active. The repo lives under `~/Documents`, which iCloud
+Drive syncs by default; excluding it or moving the checkout outside the synced tree is the real fix.
+
+This matters beyond convenience: step 2.5 makes agent-created PRs depend on a *local* `make check`
+result, so a corrupted venv will make the publisher fail or, worse, report a misleading gate outcome.
 
 **Known repo issues**
 
