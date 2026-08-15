@@ -11,6 +11,7 @@ repositories:
       lint: make lint
       format: make format-check
       security: make security
+      check: make check
       minimum_coverage: 90
     policy:
       create_draft_prs: true

@@ -41,10 +41,13 @@ directory *is* written, and unavoidably so for a worktree-based executor: `git f
 ## Gates
 
 Only the configured gates run, in the fixed order `bootstrap`, `format`, `lint`, `test`,
-`coverage`, `security`. A gate absent from `quality_gates` is recorded as `skipped` and never as a
-pass, and a repository without a `test` gate is a blocker rather than a green run. Gate strings are
-operator-supplied and are split with `shlex` and run with no shell, a bounded timeout, and no GitHub
-token in the environment; a string `shlex` cannot parse fails that gate instead of aborting the run.
+`coverage`, `security`, `check`. `check` must be the repository's CI-equivalent aggregate command
+(normally `make check`, including lock checking, format, lint, test, coverage, and security).
+Component gates are recorded as useful evidence, but a report is `passed` only when `check` itself
+passes. A missing `check` is `passed_partial` and is not eligible for pull-request publication.
+Gate strings are operator-supplied and are split with `shlex` and run with no shell, a bounded
+timeout, and no GitHub token in the environment; a string `shlex` cannot parse fails that gate
+instead of aborting the run.
 
 `minimum_coverage` is the operator's independent backstop for a pull request that edits the
 project's own coverage threshold, so it is read from a machine-readable `coverage.json` or
@@ -57,8 +60,8 @@ gate rather than being resolved in the repository's favour.
 
 - `test-report.json` and `test-report.md` in the timestamped run directory
 - `latest-test-report.json` and `latest-test-report.md` at the state-directory root
-- Status: `passed` (every gate ran and passed), `passed_partial` (nothing failed, but at least one
-  gate was not configured), `failed`, or `blocked`
+- Status: `passed` (the configured CI-equivalent `check` gate passed), `passed_partial` (nothing
+  failed, but no passing `check` gate exists), `failed`, or `blocked`
 
 The artifact is written on every exit path, including an interrupt, because the `latest-*` pointer
 is the interface to the next stage and a stale pointer would be read as a fresh verdict.

@@ -201,11 +201,13 @@ only, new files the engineer created are copied into the worktree separately, re
 file transferred either way. Any other upstream status is a blocker.
 
 Only configured gates run, in the order `bootstrap`, `format`, `lint`, `test`, `coverage`,
-`security`. Each gate's command, exit code, and truncated output are recorded; a gate that is not
-configured is reported as `skipped` and never as a pass, and a repository without a `test` gate is
-refused outright. Gate commands come from operator configuration, so they are split with `shlex` and
-run with no shell, a bounded timeout (`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and no GitHub
-token in their environment; a command `shlex` cannot parse fails that gate rather than the run.
+`security`, `check`. `check` is the CI-equivalent aggregate command (normally `make check`), so it
+must cover lock checking, formatting, linting, tests, coverage, and security. Each gate's command,
+exit code, and truncated output are recorded; a missing `check` is reported as `skipped` and yields
+only `passed_partial`, never a publication-eligible pass. Gate commands come from operator
+configuration, so they are split with `shlex` and run with no shell, a bounded timeout
+(`TEST_GATE_TIMEOUT_SECONDS`, default 1800), and no GitHub token in their environment; a command
+`shlex` cannot parse fails that gate rather than the run.
 
 `minimum_coverage` is the operator's independent backstop against a pull request that edits the
 project's own coverage threshold, so the percentage is read from a machine-readable `coverage.json`
@@ -216,8 +218,10 @@ rows fail the gate.
 
 Reports are written to `test-report.json`/`test-report.md` in the run directory and to
 `latest-test-report.json`/`latest-test-report.md`, on every exit path including an interrupt — a
-stale pointer would otherwise be read as the current verdict. Status is `passed` (all six gates ran
-and passed), `passed_partial` (nothing failed but a gate was unconfigured), `failed`, or `blocked`.
+stale pointer would otherwise be read as the current verdict. Status is `passed` only when the exact
+CI-equivalent `check` command passed; `passed_partial` means no gate failed but that required evidence
+is absent, followed by `failed` or `blocked`. A future publisher must refuse every status other than
+`passed` and verify that the report belongs to its exact work item, repository, and tested commit.
 The disposable worktree is always removed, and a removal failure is called out in the report for
 operator cleanup. The stage never changes the configured checkout's working tree or index, commits,
 pushes, creates pull requests, merges, or dismisses alerts; it does write `.git` metadata there
