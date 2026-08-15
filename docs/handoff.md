@@ -140,31 +140,14 @@ branch would stop this recurring.**
 
 **Queued work**
 
-- **Step 2.5 — the per-repository half.** The enforcement side is done in PR #17 above: `repo-agent` now
-  refuses to treat a report as `passed` without a passing `check` gate. What remains is giving each
-  managed repository the `make check` target that gate invokes. Until a repo has one, its runs report
-  `passed_partial` and are correctly ineligible for publication — the contract fails closed, so this is
-  not urgent, but Flow B's publisher is blocked on it.
-
-  Each target must be **non-mutating** and run format validation, linting, tests, coverage, and security,
-  plus lock/dependency validation where the project uses it.
-
-  Audit completed locally on 2026-08-14; none of the following repositories fully meets the contract:
-
-  - `bourbonbook`: no `check` target. `pr-review` is close, but the CI-equivalent pre-PR gate needs a
-    stable `make check` entry point.
-  - `schwinn_stationary_bike`: no `check`, lint, or non-mutating format-check target. `local-test`
-    covers tests, coverage, security, and a Docker UI test only.
-  - `TNO-Portal`: no `check`, lint, format-check, or security target.
-  - `financial_analysis`: has `check`, but it omits format validation; its `format` target modifies
-    files and must not be used as a check.
-  - `college_planner`: no `check`; its existing `format` target modifies files, so a non-mutating
-    format-check must be added to the aggregate gate.
-  - `giftmatcher`: no Makefile.
-
-  Do not weaken a repository's GitHub CI while adding these targets. Retain its existing project-specific
-  checks (for example type checking, dependency audits, PR hygiene, or Docker/UI checks) when they are
-  already part of its CI contract.
+- **Completed — Step 2.5, CI-equivalent Makefile gates.** The enforcement side is in PR #17: `repo-agent`
+  refuses to treat a report as `passed` without a successful `check` gate. The per-repository work is
+  also complete for `bourbonbook`, `schwinn_stationary_bike`, `TNO-Portal`, `financial_analysis`,
+  `college_planner`, and `giftmatcher`: each now provides a non-mutating `make check` target for the
+  agent's pre-publication gate. These targets validate formatting, linting, tests, coverage, and
+  security, with each repository retaining its applicable lock/dependency and project-specific CI
+  checks. Flow B's publisher may rely on the matching successful local `make check` artifact; a partial,
+  failed, stale, or mismatched report remains ineligible for publication.
 
 - **Step 1b — onboarding skill.** A skill that applies this configuration to a *new* repo. Its defining
   rule: **derive from what the repo already has.** Survey existing workflows and real check-run names,
