@@ -31,7 +31,6 @@ _ROUTE_REPORT = "report_only"
 
 _AGENT_BRANCH_PREFIX = "repo-agent/"
 _DEPENDABOT_LOGIN = "dependabot"
-_REBASE_COMMENT = "@dependabot rebase"
 
 # Step 1 established one canonical required context across the org. It is the default rather than a
 # constant so a repository can declare its own in repo-info.yml without a code change.

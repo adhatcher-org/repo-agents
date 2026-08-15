@@ -1577,6 +1577,7 @@ def test_test_execute_runs_configured_gates_against_an_existing_pull_request(
         "format",
         "lint",
         "security",
+        "check",
     ]
     assert report["worktree_removed"] is True
     assert not Path(report["worktree_path"]).exists()
@@ -2284,10 +2285,10 @@ def test_test_execute_reads_coverage_from_the_report_file_not_gate_stdout(
     assert report["status"] == "failed"
 
 
-def test_test_execute_reports_passed_only_when_every_gate_ran(
+def test_test_execute_reports_passed_only_when_ci_equivalent_check_passes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """`passed` must mean the full gate set ran, not that the configured subset happened to pass."""
+    """`passed` requires the exact CI-equivalent aggregate command, not component gates alone."""
     workspace, state_dir = _testing_environment(
         monkeypatch,
         tmp_path,
@@ -2298,6 +2299,7 @@ def test_test_execute_reports_passed_only_when_every_gate_ran(
             "test": "true",
             "coverage": "true",
             "security": "true",
+            "check": "true",
             "minimum_coverage": 90,
         },
     )
@@ -2313,7 +2315,40 @@ def test_test_execute_reports_passed_only_when_every_gate_ran(
 
     report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
     assert report["status"] == "passed"
-    assert [gate["status"] for gate in report["gates"]] == ["passed"] * 6
+    assert [gate["status"] for gate in report["gates"]] == ["passed"] * 7
+
+
+def test_test_execute_marks_component_only_results_non_publishable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Individual green gates must not stand in for CI's `make check` command."""
+    workspace, state_dir = _testing_environment(
+        monkeypatch,
+        tmp_path,
+        {
+            "bootstrap": "true",
+            "format": "true",
+            "lint": "true",
+            "test": "true",
+            "coverage": "true",
+            "security": "true",
+            "minimum_coverage": 90,
+        },
+    )
+    _git_command(workspace, "switch", "-c", "repo-agent/engineer-12")
+    (workspace / "coverage.json").write_text(
+        json.dumps({"totals": {"percent_covered": 95.0}}), encoding="utf-8"
+    )
+    _git_command(workspace, "add", "-A")
+    _git_command(workspace, "commit", "-m", "add coverage report")
+    _branch_execution(state_dir, workspace, "repo-agent/engineer-12", "owner/repo:alert:13")
+
+    assert testing.run_test_execute("owner/repo:alert:13") == 0
+
+    report = json.loads((state_dir / "latest-test-report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "passed_partial"
+    check = next(gate for gate in report["gates"] if gate["gate"] == "check")
+    assert check == {"gate": "check", "status": "skipped", "reason": "not configured"}
 
 
 def test_test_execute_blocks_a_pull_request_url_from_another_repository(
