@@ -1,5 +1,16 @@
 # Intent vs. implementation
 
+>**SUPERSEDED (2026-08-16) — retained for history only.**
+> The authoritative doc-vs-code reconciliation is now `docs/implementation-status.md`, which is
+> anchored to `file.py:LINE` evidence throughout.
+>
+> This document predates `src/repo_agent/triage.py` (Flow A, 1076 lines). Known-false claims as of
+> `383d28d`: R12's "escalation: no mechanism exists at all" — an escalation route, an evidence
+> record, a `latest-escalations.json` queue and Telegram delivery all exist (`triage.py:28`, `720`,
+> `922`, `768`); what is missing is escalation on the *architect/dispatch* path only. The R2b row and
+> the "six of fourteen are fully built" arithmetic are stale for the same reason.
+
+
 A reconciliation of `docs/overview.md` (what this repo is meant to do) against what is actually
 built, as of the `test-execute` stage landing.
 
